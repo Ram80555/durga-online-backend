@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
 const connectDB = require('./config/db');
-const MARKETS = require('./config/markets');
+const MARKETS = require('./config/market');
 const { isMarketOpenForBet } = require('./utils/marketCheck');
 const User = require('./models/User');
 const Bet = require('./models/Bet');
