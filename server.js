@@ -1,6 +1,7 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const https = require('https');
 
 const app = express();
 app.use(cors());
@@ -9,7 +10,11 @@ app.use(express.json());
 const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://ramdulare2411_db_user:rbQTRoDRPKuEDkMF@cluster0.pimwfzo.mongodb.net/durgaonline?retryWrites=true&w=majority";
 
 mongoose.connect(MONGO_URI)
-  .then(() => console.log("MongoDB Database Connected"))
+  .then(() => {
+    console.log("MongoDB Database Connected");
+    // Initial fetch on server start
+    MARKET_SCHEDULE.forEach(m => processMarketSettlement(m));
+  })
   .catch(err => console.log("Mongo Error: ", err));
 
 // SCHEMAS
@@ -60,6 +65,113 @@ async function logStatement(username, type, coins, remark) {
   } catch(e){}
 }
 
+const MARKET_SCHEDULE = [
+  { name: 'KOSPI', symbol: '^KS11', settleTime: '11:52' },
+  { name: 'HANG SENG', symbol: '^HSI', settleTime: '13:32' },
+  { name: 'SENSEX', symbol: '^BSESN', settleTime: '15:32' },
+  { name: 'DAX', symbol: '^GDAXI', settleTime: '22:02' },
+  { name: 'DOW JONES', symbol: '^DJI', settleTime: '01:32' }
+];
+
+// FETCH QUOTE WITH USER-AGENT HEADER (PREVENTS 403 BLOCKS)
+function fetchQuotePrice(symbol) {
+  return new Promise((resolve, reject) => {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`;
+    const options = {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      }
+    };
+
+    https.get(url, options, (res) => {
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(body);
+          if (json.chart && json.chart.result && json.chart.result[0]) {
+            const meta = json.chart.result[0].meta;
+            const price = meta.regularMarketPrice || meta.chartPreviousClose || meta.previousClose;
+            resolve(price);
+          } else {
+            reject('No price meta');
+          }
+        } catch(e) { reject(e); }
+      });
+    }).on('error', err => reject(err));
+  });
+}
+
+// AUTO SETTLE PROCESS
+async function processMarketSettlement(m) {
+  try {
+    const closePrice = await fetchQuotePrice(m.symbol);
+    if (!closePrice) return;
+
+    const priceStr = Number(closePrice).toFixed(2);
+    const singleDigit = priceStr.slice(-1); // Right-most digit
+
+    const parts = priceStr.split('.');
+    const doubleDigit = parts.length > 1 ? parts[1].padEnd(2, '0').slice(0, 2) : priceStr.slice(-2);
+
+    await MarketResult.findOneAndUpdate(
+      { market: m.name },
+      { closingValue: priceStr, singleDigit, doubleDigit, lastUpdated: new Date() },
+      { upsert: true, new: true }
+    );
+
+    const pendingBets = await Bet.find({ market: m.name, status: 'PENDING' });
+
+    for (let b of pendingBets) {
+      let isWin = false;
+      let winMultiplier = 0;
+
+      if (b.type === 'single' && b.digit === singleDigit) {
+        isWin = true;
+        winMultiplier = 9;
+      } else if (b.type === 'double' && b.digit === doubleDigit) {
+        isWin = true;
+        winMultiplier = 80;
+      }
+
+      if (isWin) {
+        b.status = 'WIN';
+        const winAmount = b.coins * winMultiplier;
+        const user = await User.findOne({ username: b.username });
+        if (user) {
+          user.balance += winAmount;
+          user.exposure = Math.max(0, user.exposure - b.coins);
+          await user.save();
+          await logStatement(user.username, 'BET WIN', winAmount, `Won ${b.market} ${b.type.toUpperCase()} (${b.digit}). Payout ${winMultiplier}x.`);
+        }
+      } else {
+        b.status = 'LOSS';
+        const user = await User.findOne({ username: b.username });
+        if (user) {
+          user.exposure = Math.max(0, user.exposure - b.coins);
+          await user.save();
+        }
+      }
+      await b.save();
+    }
+  } catch (err) {}
+}
+
+setInterval(() => {
+  const now = new Date();
+  const istOffset = 5.5 * 60 * 60 * 1000;
+  const istTime = new Date(now.getTime() + (now.getTimezoneOffset() * 60000) + istOffset);
+  const curH = istTime.getHours().toString().padStart(2, '0');
+  const curM = istTime.getMinutes().toString().padStart(2, '0');
+  const currentTimeStr = `${curH}:${curM}`;
+
+  MARKET_SCHEDULE.forEach(m => {
+    if (m.settleTime === currentTimeStr) {
+      processMarketSettlement(m);
+    }
+  });
+}, 30000);
+
 // AUTH ENDPOINTS
 app.post('/api/auth/login', async (req, res) => {
   try {
@@ -98,12 +210,17 @@ app.post('/api/auth/verify-session', async (req, res) => {
 
 app.get('/api/market/results', async (req, res) => {
   try {
-    const results = await MarketResult.find();
+    let results = await MarketResult.find();
+    if (!results || results.length === 0) {
+      for (let m of MARKET_SCHEDULE) {
+        await processMarketSettlement(m);
+      }
+      results = await MarketResult.find();
+    }
     res.json(results);
   } catch (err) { res.status(500).json({ msg: "Error fetching results" }); }
 });
 
-// PLACE BET ROUTE (HANDLES BOTH username AND userId)
 app.post('/api/client/place-bet', async (req, res) => {
   try {
     const { username, userId, market, type, selectedDigit, coins } = req.body;
