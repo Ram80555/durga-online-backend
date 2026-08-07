@@ -1,7 +1,7 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const yahooFinance = require('yahoo-finance2').default;
+const https = require('https');
 
 const app = express();
 app.use(cors());
@@ -61,7 +61,6 @@ async function logStatement(username, type, coins, remark) {
   } catch(e){}
 }
 
-// MARKET CONFIGURATION WITH IST CLOSE AND SETTLE TIMINGS (CLOSE + 2 MINS)
 const MARKET_SCHEDULE = [
   { name: 'KOSPI', symbol: '^KS11', settleTime: '11:52' },
   { name: 'HANG SENG', symbol: '^HSI', settleTime: '13:32' },
@@ -70,28 +69,42 @@ const MARKET_SCHEDULE = [
   { name: 'DOW JONES', symbol: '^DJI', settleTime: '01:32' }
 ];
 
-// FETCH CLOSING PRICE & AUTO SETTLE COINS
+// LIGHTWEIGHT NATIVE FETCH FOR GLOBAL RATES
+function fetchQuotePrice(symbol) {
+  return new Promise((resolve, reject) => {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`;
+    https.get(url, (res) => {
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(body);
+          const price = json.chart.result[0].meta.regularMarketPrice;
+          resolve(price);
+        } catch(e) { reject(e); }
+      });
+    }).on('error', err => reject(err));
+  });
+}
+
+// AUTO SETTLE PROCESS
 async function processMarketSettlement(m) {
   try {
-    const quote = await yahooFinance.quote(m.symbol);
-    const closePrice = quote.regularMarketPrice || quote.postMarketPrice || quote.preMarketPrice;
-
+    const closePrice = await fetchQuotePrice(m.symbol);
     if (!closePrice) return;
 
-    const priceStr = closePrice.toFixed(2); // e.g., "6258.77"
-    const singleDigit = priceStr.slice(-1); // Right-most last digit (7)
+    const priceStr = Number(closePrice).toFixed(2);
+    const singleDigit = priceStr.slice(-1); // Extreme right digit
 
     const parts = priceStr.split('.');
-    const doubleDigit = parts.length > 1 ? parts[1].padEnd(2, '0').slice(0, 2) : priceStr.slice(-2); // Decimal digits (77)
+    const doubleDigit = parts.length > 1 ? parts[1].padEnd(2, '0').slice(0, 2) : priceStr.slice(-2);
 
-    // Save/Update Closing Result Box
     await MarketResult.findOneAndUpdate(
       { market: m.name },
       { closingValue: priceStr, singleDigit, doubleDigit, lastUpdated: new Date() },
       { upsert: true, new: true }
     );
 
-    // Settle User Bets
     const pendingBets = await Bet.find({ market: m.name, status: 'PENDING' });
 
     for (let b of pendingBets) {
@@ -100,10 +113,10 @@ async function processMarketSettlement(m) {
 
       if (b.type === 'single' && b.digit === singleDigit) {
         isWin = true;
-        winMultiplier = 9; // Single Payout 1:9
+        winMultiplier = 9; // Single 1:9
       } else if (b.type === 'double' && b.digit === doubleDigit) {
         isWin = true;
-        winMultiplier = 80; // Double Payout 1:80
+        winMultiplier = 80; // Double 1:80
       }
 
       if (isWin) {
@@ -126,13 +139,9 @@ async function processMarketSettlement(m) {
       }
       await b.save();
     }
-    console.log(`[AUTO-SETTLE SUCCESS] ${m.name} -> Close: ${priceStr} | Single: ${singleDigit} | Double: ${doubleDigit}`);
-  } catch (err) {
-    console.log(`[AUTO-SETTLE ERROR] ${m.name}:`, err.message);
-  }
+  } catch (err) {}
 }
 
-// SCHEDULED CHECK (RUNS EVERY 30 SECONDS TO CHECK CLOSE + 2 MIN WINDOW)
 setInterval(() => {
   const now = new Date();
   const istOffset = 5.5 * 60 * 60 * 1000;
@@ -148,7 +157,7 @@ setInterval(() => {
   });
 }, 30000);
 
-// AUTH & API ENDPOINTS
+// AUTH ENDPOINTS
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -191,9 +200,14 @@ app.get('/api/market/results', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Error fetching results" }); }
 });
 
+// PLACE BET ROUTE (FIXED RAW JSON DETECT)
 app.post('/api/client/place-bet', async (req, res) => {
   try {
     const { username, market, type, selectedDigit, coins } = req.body;
+    if (!username || !market || !type || !selectedDigit || !coins) {
+      return res.status(400).json({ msg: "Missing required fields" });
+    }
+
     const user = await User.findOne({ username });
     if (!user) return res.status(404).json({ msg: "User not found" });
 
@@ -206,12 +220,14 @@ app.post('/api/client/place-bet', async (req, res) => {
     user.exposure = (user.exposure || 0) + betCoins;
     await user.save();
 
-    const newBet = new Bet({ username, market, type, digit: selectedDigit, coins: betCoins });
+    const newBet = new Bet({ username, market, type, digit: String(selectedDigit), coins: betCoins });
     await newBet.save();
 
     await logStatement(username, 'BET PLACED', betCoins, `Bet placed on ${market} (${type.toUpperCase()}: ${selectedDigit})`);
-    res.json({ msg: "Bet placed successfully!" });
-  } catch (err) { res.status(500).json({ msg: "Error placing bet" }); }
+    res.json({ msg: "Prediction placed successfully!" });
+  } catch (err) {
+    res.status(500).json({ msg: "Server error placing prediction" });
+  }
 });
 
 app.get('/api/client/pending-bets/:username', async (req, res) => {
