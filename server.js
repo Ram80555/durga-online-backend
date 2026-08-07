@@ -1,7 +1,6 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const https = require('https');
 
 const app = express();
 app.use(cors());
@@ -61,102 +60,6 @@ async function logStatement(username, type, coins, remark) {
   } catch(e){}
 }
 
-const MARKET_SCHEDULE = [
-  { name: 'KOSPI', symbol: '^KS11', settleTime: '11:52' },
-  { name: 'HANG SENG', symbol: '^HSI', settleTime: '13:32' },
-  { name: 'SENSEX', symbol: '^BSESN', settleTime: '15:32' },
-  { name: 'DAX', symbol: '^GDAXI', settleTime: '22:02' },
-  { name: 'DOW JONES', symbol: '^DJI', settleTime: '01:32' }
-];
-
-// LIGHTWEIGHT NATIVE FETCH FOR GLOBAL RATES
-function fetchQuotePrice(symbol) {
-  return new Promise((resolve, reject) => {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`;
-    https.get(url, (res) => {
-      let body = '';
-      res.on('data', chunk => body += chunk);
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(body);
-          const price = json.chart.result[0].meta.regularMarketPrice;
-          resolve(price);
-        } catch(e) { reject(e); }
-      });
-    }).on('error', err => reject(err));
-  });
-}
-
-// AUTO SETTLE PROCESS
-async function processMarketSettlement(m) {
-  try {
-    const closePrice = await fetchQuotePrice(m.symbol);
-    if (!closePrice) return;
-
-    const priceStr = Number(closePrice).toFixed(2);
-    const singleDigit = priceStr.slice(-1); // Extreme right digit
-
-    const parts = priceStr.split('.');
-    const doubleDigit = parts.length > 1 ? parts[1].padEnd(2, '0').slice(0, 2) : priceStr.slice(-2);
-
-    await MarketResult.findOneAndUpdate(
-      { market: m.name },
-      { closingValue: priceStr, singleDigit, doubleDigit, lastUpdated: new Date() },
-      { upsert: true, new: true }
-    );
-
-    const pendingBets = await Bet.find({ market: m.name, status: 'PENDING' });
-
-    for (let b of pendingBets) {
-      let isWin = false;
-      let winMultiplier = 0;
-
-      if (b.type === 'single' && b.digit === singleDigit) {
-        isWin = true;
-        winMultiplier = 9; // Single 1:9
-      } else if (b.type === 'double' && b.digit === doubleDigit) {
-        isWin = true;
-        winMultiplier = 80; // Double 1:80
-      }
-
-      if (isWin) {
-        b.status = 'WIN';
-        const winAmount = b.coins * winMultiplier;
-        const user = await User.findOne({ username: b.username });
-        if (user) {
-          user.balance += winAmount;
-          user.exposure = Math.max(0, user.exposure - b.coins);
-          await user.save();
-          await logStatement(user.username, 'BET WIN', winAmount, `Won ${b.market} ${b.type.toUpperCase()} (${b.digit}). Payout ${winMultiplier}x.`);
-        }
-      } else {
-        b.status = 'LOSS';
-        const user = await User.findOne({ username: b.username });
-        if (user) {
-          user.exposure = Math.max(0, user.exposure - b.coins);
-          await user.save();
-        }
-      }
-      await b.save();
-    }
-  } catch (err) {}
-}
-
-setInterval(() => {
-  const now = new Date();
-  const istOffset = 5.5 * 60 * 60 * 1000;
-  const istTime = new Date(now.getTime() + (now.getTimezoneOffset() * 60000) + istOffset);
-  const curH = istTime.getHours().toString().padStart(2, '0');
-  const curM = istTime.getMinutes().toString().padStart(2, '0');
-  const currentTimeStr = `${curH}:${curM}`;
-
-  MARKET_SCHEDULE.forEach(m => {
-    if (m.settleTime === currentTimeStr) {
-      processMarketSettlement(m);
-    }
-  });
-}, 30000);
-
 // AUTH ENDPOINTS
 app.post('/api/auth/login', async (req, res) => {
   try {
@@ -200,33 +103,41 @@ app.get('/api/market/results', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Error fetching results" }); }
 });
 
-// PLACE BET ROUTE (FIXED RAW JSON DETECT)
+// PLACE BET ROUTE (HANDLES BOTH username AND userId)
 app.post('/api/client/place-bet', async (req, res) => {
   try {
-    const { username, market, type, selectedDigit, coins } = req.body;
-    if (!username || !market || !type || !selectedDigit || !coins) {
-      return res.status(400).json({ msg: "Missing required fields" });
+    const { username, userId, market, type, selectedDigit, coins } = req.body;
+    const targetUser = username || userId;
+
+    if (!targetUser || !market || !type || !selectedDigit || !coins) {
+      return res.status(400).json({ msg: "Missing prediction parameters" });
     }
 
-    const user = await User.findOne({ username });
-    if (!user) return res.status(404).json({ msg: "User not found" });
+    const user = await User.findOne({ $or: [{ username: targetUser }, { _id: mongoose.Types.ObjectId.isValid(targetUser) ? targetUser : null }] });
+    if (!user) return res.status(404).json({ msg: "User account not found!" });
 
     const betCoins = Number(coins);
     if (user.balance < betCoins) {
-      return res.status(400).json({ msg: "Insufficient balance!" });
+      return res.status(400).json({ msg: "Insufficient balance for prediction!" });
     }
 
     user.balance -= betCoins;
     user.exposure = (user.exposure || 0) + betCoins;
     await user.save();
 
-    const newBet = new Bet({ username, market, type, digit: String(selectedDigit), coins: betCoins });
+    const newBet = new Bet({
+      username: user.username,
+      market,
+      type,
+      digit: String(selectedDigit),
+      coins: betCoins
+    });
     await newBet.save();
 
-    await logStatement(username, 'BET PLACED', betCoins, `Bet placed on ${market} (${type.toUpperCase()}: ${selectedDigit})`);
+    await logStatement(user.username, 'BET PLACED', betCoins, `Prediction placed on ${market} (${type.toUpperCase()}: ${selectedDigit})`);
     res.json({ msg: "Prediction placed successfully!" });
   } catch (err) {
-    res.status(500).json({ msg: "Server error placing prediction" });
+    res.status(500).json({ msg: "Server error processing prediction" });
   }
 });
 
@@ -268,7 +179,7 @@ app.get('/api/admin/clients', async (req, res) => {
 app.post('/api/admin/update-coins', async (req, res) => {
   try {
     const { userId, coins, action } = req.body;
-    const user = await User.findOne({ $or: [{ _id: userId }, { username: userId }] });
+    const user = await User.findOne({ $or: [{ _id: mongoose.Types.ObjectId.isValid(userId) ? userId : null }, { username: userId }] });
     if (!user) return res.status(404).json({ msg: "User not found" });
 
     const amount = Number(coins);
