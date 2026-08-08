@@ -31,7 +31,7 @@ const User = mongoose.model('User', userSchema);
 const betSchema = new mongoose.Schema({
   username: { type: String, required: true },
   market: { type: String, required: true },
-  type: { type: String, required: true },
+  type: { type: String, required: true }, // 'single_a', 'single_b', 'double'
   digit: { type: String, required: true },
   coins: { type: Number, required: true },
   status: { type: String, default: 'PENDING' },
@@ -53,7 +53,8 @@ const Statement = mongoose.model('Statement', statementSchema);
 const resultSchema = new mongoose.Schema({
   market: { type: String, required: true, unique: true },
   closingValue: { type: String, default: '0.00' },
-  singleDigit: { type: String, default: '-' },
+  singleDigitA: { type: String, default: '-' },
+  singleDigitB: { type: String, default: '-' },
   doubleDigit: { type: String, default: '--' },
   lastUpdated: { type: Date, default: Date.now }
 });
@@ -100,13 +101,13 @@ function fetchQuotePrice(symbol) {
   });
 }
 
-// AUTO SETTLE PROCESS (SATURDAY & SUNDAY SETTLEMENT DEFERRED TO MONDAY)
+// AUTO SETTLE PROCESS WITH SINGLE A, SINGLE B, DOUBLE
 async function processMarketSettlement(m) {
   try {
     const now = new Date();
     const istOffset = 5.5 * 60 * 60 * 1000;
     const istTime = new Date(now.getTime() + (now.getTimezoneOffset() * 60000) + istOffset);
-    const dayOfWeek = istTime.getDay(); // 0 = Sunday, 6 = Saturday
+    const dayOfWeek = istTime.getDay();
 
     if (dayOfWeek === 0 || dayOfWeek === 6) {
       console.log(`[WEEKEND] Market settlement paused on Weekend for ${m.name}. All bets stay pending for Monday.`);
@@ -116,14 +117,16 @@ async function processMarketSettlement(m) {
     const closePrice = await fetchQuotePrice(m.symbol);
     if (!closePrice) return;
 
-    const priceStr = Number(closePrice).toFixed(2);
-    const singleDigit = priceStr.slice(-1);
+    const priceStr = Number(closePrice).toFixed(2); // e.g., "6258.58"
     const parts = priceStr.split('.');
-    const doubleDigit = parts.length > 1 ? parts[1].padEnd(2, '0').slice(0, 2) : priceStr.slice(-2);
+    const doubleDigit = parts.length > 1 ? parts[1].padEnd(2, '0').slice(0, 2) : priceStr.slice(-2); // "58"
+    
+    const singleDigitA = doubleDigit.slice(0, 1); // "5" (Second last digit)
+    const singleDigitB = doubleDigit.slice(1, 2); // "8" (Last digit)
 
     await MarketResult.findOneAndUpdate(
       { market: m.name },
-      { closingValue: priceStr, singleDigit, doubleDigit, lastUpdated: new Date() },
+      { closingValue: priceStr, singleDigitA, singleDigitB, doubleDigit, lastUpdated: new Date() },
       { upsert: true, new: true }
     );
 
@@ -133,7 +136,10 @@ async function processMarketSettlement(m) {
       let isWin = false;
       let winMultiplier = 0;
 
-      if (b.type === 'single' && b.digit === singleDigit) {
+      if (b.type === 'single_a' && b.digit === singleDigitA) {
+        isWin = true;
+        winMultiplier = 9;
+      } else if (b.type === 'single_b' && b.digit === singleDigitB) {
         isWin = true;
         winMultiplier = 9;
       } else if (b.type === 'double' && b.digit === doubleDigit) {
@@ -237,7 +243,6 @@ app.get('/api/market/results', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Error fetching results" }); }
 });
 
-// PLACE BET ROUTE WITH BALANCE TRACKING
 app.post('/api/client/place-bet', async (req, res) => {
   try {
     const { username, userId, market, type, selectedDigit, coins } = req.body;
