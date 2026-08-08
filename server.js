@@ -44,6 +44,8 @@ const statementSchema = new mongoose.Schema({
   username: { type: String, required: true },
   type: { type: String, required: true },
   coins: { type: Number, default: 0 },
+  oldBalance: { type: Number, default: 0 },
+  newBalance: { type: Number, default: 0 },
   remark: { type: String, default: '' }
 });
 const Statement = mongoose.model('Statement', statementSchema);
@@ -51,14 +53,15 @@ const Statement = mongoose.model('Statement', statementSchema);
 const resultSchema = new mongoose.Schema({
   market: { type: String, required: true, unique: true },
   closingValue: { type: String, default: '0.00' },
+  singleDigit: { type: String, default: '-' },
   doubleDigit: { type: String, default: '--' },
   lastUpdated: { type: Date, default: Date.now }
 });
 const MarketResult = mongoose.model('MarketResult', resultSchema);
 
-async function logStatement(username, type, coins, remark) {
+async function logStatement(username, type, coins, oldBalance, newBalance, remark) {
   try {
-    const entry = new Statement({ username, type, coins, remark });
+    const entry = new Statement({ username, type, coins, oldBalance, newBalance, remark });
     await entry.save();
   } catch(e){}
 }
@@ -97,7 +100,7 @@ function fetchQuotePrice(symbol) {
   });
 }
 
-// AUTO SETTLE PROCESS (WITH SATURDAY & SUNDAY SKIP RULE)
+// AUTO SETTLE PROCESS (SATURDAY & SUNDAY SETTLEMENT DEFERRED TO MONDAY)
 async function processMarketSettlement(m) {
   try {
     const now = new Date();
@@ -105,9 +108,8 @@ async function processMarketSettlement(m) {
     const istTime = new Date(now.getTime() + (now.getTimezoneOffset() * 60000) + istOffset);
     const dayOfWeek = istTime.getDay(); // 0 = Sunday, 6 = Saturday
 
-    // SKIP SETTLEMENT ON SATURDAY & SUNDAY
     if (dayOfWeek === 0 || dayOfWeek === 6) {
-      console.log(`[WEEKEND SKIP] Markets closed on Weekend (${m.name}). Settlement deferred to Monday.`);
+      console.log(`[WEEKEND] Market settlement paused on Weekend for ${m.name}. All bets stay pending for Monday.`);
       return;
     }
 
@@ -115,12 +117,13 @@ async function processMarketSettlement(m) {
     if (!closePrice) return;
 
     const priceStr = Number(closePrice).toFixed(2);
+    const singleDigit = priceStr.slice(-1);
     const parts = priceStr.split('.');
     const doubleDigit = parts.length > 1 ? parts[1].padEnd(2, '0').slice(0, 2) : priceStr.slice(-2);
 
     await MarketResult.findOneAndUpdate(
       { market: m.name },
-      { closingValue: priceStr, doubleDigit, lastUpdated: new Date() },
+      { closingValue: priceStr, singleDigit, doubleDigit, lastUpdated: new Date() },
       { upsert: true, new: true }
     );
 
@@ -130,9 +133,12 @@ async function processMarketSettlement(m) {
       let isWin = false;
       let winMultiplier = 0;
 
-      if (b.type === 'double' && b.digit === doubleDigit) {
+      if (b.type === 'single' && b.digit === singleDigit) {
         isWin = true;
-        winMultiplier = 80; // Double 1:80
+        winMultiplier = 9;
+      } else if (b.type === 'double' && b.digit === doubleDigit) {
+        isWin = true;
+        winMultiplier = 80;
       }
 
       if (isWin) {
@@ -140,10 +146,11 @@ async function processMarketSettlement(m) {
         const winAmount = b.coins * winMultiplier;
         const user = await User.findOne({ username: b.username });
         if (user) {
+          const oldBal = user.balance;
           user.balance += winAmount;
           user.exposure = Math.max(0, user.exposure - b.coins);
           await user.save();
-          await logStatement(user.username, 'BET WIN', winAmount, `Won ${b.market} DOUBLE (${b.digit}). Payout ${winMultiplier}x.`);
+          await logStatement(user.username, 'BET WIN', winAmount, oldBal, user.balance, `Won ${b.market} ${b.type.toUpperCase()} (${b.digit}). Payout ${winMultiplier}x.`);
         }
       } else {
         b.status = 'LOSS';
@@ -209,7 +216,6 @@ app.post('/api/auth/verify-session', async (req, res) => {
   } catch (err) { res.status(500).json({ valid: false }); }
 });
 
-// CHANGE PASSWORD ROUTE
 app.post('/api/client/change-password', async (req, res) => {
   try {
     const { username, oldPassword, newPassword } = req.body;
@@ -219,7 +225,7 @@ app.post('/api/client/change-password', async (req, res) => {
     }
     user.password = newPassword;
     await user.save();
-    await logStatement(username, 'PASSWORD CHANGED', 0, 'User updated account password.');
+    await logStatement(username, 'PASSWORD CHANGED', 0, user.balance, user.balance, 'User updated account password.');
     res.json({ msg: "Password changed successfully!" });
   } catch (err) { res.status(500).json({ msg: "Error updating password" }); }
 });
@@ -231,6 +237,7 @@ app.get('/api/market/results', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Error fetching results" }); }
 });
 
+// PLACE BET ROUTE WITH BALANCE TRACKING
 app.post('/api/client/place-bet', async (req, res) => {
   try {
     const { username, userId, market, type, selectedDigit, coins } = req.body;
@@ -248,6 +255,7 @@ app.post('/api/client/place-bet', async (req, res) => {
       return res.status(400).json({ msg: "Insufficient balance for prediction!" });
     }
 
+    const oldBal = user.balance;
     user.balance -= betCoins;
     user.exposure = (user.exposure || 0) + betCoins;
     await user.save();
@@ -261,7 +269,7 @@ app.post('/api/client/place-bet', async (req, res) => {
     });
     await newBet.save();
 
-    await logStatement(user.username, 'BET PLACED', betCoins, `Prediction placed on ${market} (${type.toUpperCase()}: ${selectedDigit})`);
+    await logStatement(user.username, 'BET PLACED', betCoins, oldBal, user.balance, `Prediction placed on ${market} (${type.toUpperCase()}: ${selectedDigit})`);
     res.json({ msg: "Prediction placed successfully!" });
   } catch (err) { res.status(500).json({ msg: "Server error processing prediction" }); }
 });
@@ -289,7 +297,7 @@ app.post('/api/admin/create-client', async (req, res) => {
     const coins = Number(initialBalance) || 0;
     const newUser = new User({ username, password, role: 'client', balance: coins });
     await newUser.save();
-    await logStatement(username, 'ACCOUNT CREATED', coins, `Created with ${coins} coins.`);
+    await logStatement(username, 'ACCOUNT CREATED', coins, 0, coins, `Created with ${coins} coins.`);
     res.json({ msg: `Client ${username} created successfully!` });
   } catch (err) { res.status(500).json({ msg: "Database Error" }); }
 });
@@ -308,12 +316,14 @@ app.post('/api/admin/update-coins', async (req, res) => {
     if (!user) return res.status(404).json({ msg: "User not found" });
 
     const amount = Number(coins);
+    const oldBal = user.balance;
+
     if (action === 'add') {
       user.balance += amount;
-      await logStatement(user.username, 'BANK DEPOSIT', amount, `Admin deposited ${amount} coins.`);
+      await logStatement(user.username, 'BANK DEPOSIT', amount, oldBal, user.balance, `Admin deposited ${amount} coins.`);
     } else if (action === 'withdraw') {
       user.balance -= amount;
-      await logStatement(user.username, 'BANK WITHDRAW', amount, `Admin withdrew ${amount} coins.`);
+      await logStatement(user.username, 'BANK WITHDRAW', amount, oldBal, user.balance, `Admin withdrew ${amount} coins.`);
     }
 
     await user.save();
