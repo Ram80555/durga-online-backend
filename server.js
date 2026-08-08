@@ -11,8 +11,7 @@ const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://ramdulare2411_db_user:
 
 mongoose.connect(MONGO_URI)
   .then(() => {
-    console.log("MongoDB Database Connected");
-    // Initial fetch on server start
+    console.log("MongoDB Connected");
     MARKET_SCHEDULE.forEach(m => processMarketSettlement(m));
   })
   .catch(err => console.log("Mongo Error: ", err));
@@ -52,7 +51,6 @@ const Statement = mongoose.model('Statement', statementSchema);
 const resultSchema = new mongoose.Schema({
   market: { type: String, required: true, unique: true },
   closingValue: { type: String, default: '0.00' },
-  singleDigit: { type: String, default: '-' },
   doubleDigit: { type: String, default: '--' },
   lastUpdated: { type: Date, default: Date.now }
 });
@@ -73,7 +71,6 @@ const MARKET_SCHEDULE = [
   { name: 'DOW JONES', symbol: '^DJI', settleTime: '01:32' }
 ];
 
-// FETCH QUOTE WITH USER-AGENT HEADER (PREVENTS 403 BLOCKS)
 function fetchQuotePrice(symbol) {
   return new Promise((resolve, reject) => {
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`;
@@ -93,30 +90,37 @@ function fetchQuotePrice(symbol) {
             const meta = json.chart.result[0].meta;
             const price = meta.regularMarketPrice || meta.chartPreviousClose || meta.previousClose;
             resolve(price);
-          } else {
-            reject('No price meta');
-          }
+          } else { reject('No price meta'); }
         } catch(e) { reject(e); }
       });
     }).on('error', err => reject(err));
   });
 }
 
-// AUTO SETTLE PROCESS
+// AUTO SETTLE PROCESS (WITH SATURDAY & SUNDAY SKIP RULE)
 async function processMarketSettlement(m) {
   try {
+    const now = new Date();
+    const istOffset = 5.5 * 60 * 60 * 1000;
+    const istTime = new Date(now.getTime() + (now.getTimezoneOffset() * 60000) + istOffset);
+    const dayOfWeek = istTime.getDay(); // 0 = Sunday, 6 = Saturday
+
+    // SKIP SETTLEMENT ON SATURDAY & SUNDAY
+    if (dayOfWeek === 0 || dayOfWeek === 6) {
+      console.log(`[WEEKEND SKIP] Markets closed on Weekend (${m.name}). Settlement deferred to Monday.`);
+      return;
+    }
+
     const closePrice = await fetchQuotePrice(m.symbol);
     if (!closePrice) return;
 
     const priceStr = Number(closePrice).toFixed(2);
-    const singleDigit = priceStr.slice(-1); // Right-most digit
-
     const parts = priceStr.split('.');
     const doubleDigit = parts.length > 1 ? parts[1].padEnd(2, '0').slice(0, 2) : priceStr.slice(-2);
 
     await MarketResult.findOneAndUpdate(
       { market: m.name },
-      { closingValue: priceStr, singleDigit, doubleDigit, lastUpdated: new Date() },
+      { closingValue: priceStr, doubleDigit, lastUpdated: new Date() },
       { upsert: true, new: true }
     );
 
@@ -126,12 +130,9 @@ async function processMarketSettlement(m) {
       let isWin = false;
       let winMultiplier = 0;
 
-      if (b.type === 'single' && b.digit === singleDigit) {
+      if (b.type === 'double' && b.digit === doubleDigit) {
         isWin = true;
-        winMultiplier = 9;
-      } else if (b.type === 'double' && b.digit === doubleDigit) {
-        isWin = true;
-        winMultiplier = 80;
+        winMultiplier = 80; // Double 1:80
       }
 
       if (isWin) {
@@ -142,7 +143,7 @@ async function processMarketSettlement(m) {
           user.balance += winAmount;
           user.exposure = Math.max(0, user.exposure - b.coins);
           await user.save();
-          await logStatement(user.username, 'BET WIN', winAmount, `Won ${b.market} ${b.type.toUpperCase()} (${b.digit}). Payout ${winMultiplier}x.`);
+          await logStatement(user.username, 'BET WIN', winAmount, `Won ${b.market} DOUBLE (${b.digit}). Payout ${winMultiplier}x.`);
         }
       } else {
         b.status = 'LOSS';
@@ -208,15 +209,24 @@ app.post('/api/auth/verify-session', async (req, res) => {
   } catch (err) { res.status(500).json({ valid: false }); }
 });
 
+// CHANGE PASSWORD ROUTE
+app.post('/api/client/change-password', async (req, res) => {
+  try {
+    const { username, oldPassword, newPassword } = req.body;
+    const user = await User.findOne({ username, password: oldPassword });
+    if (!user) {
+      return res.status(400).json({ msg: "Old password does not match!" });
+    }
+    user.password = newPassword;
+    await user.save();
+    await logStatement(username, 'PASSWORD CHANGED', 0, 'User updated account password.');
+    res.json({ msg: "Password changed successfully!" });
+  } catch (err) { res.status(500).json({ msg: "Error updating password" }); }
+});
+
 app.get('/api/market/results', async (req, res) => {
   try {
     let results = await MarketResult.find();
-    if (!results || results.length === 0) {
-      for (let m of MARKET_SCHEDULE) {
-        await processMarketSettlement(m);
-      }
-      results = await MarketResult.find();
-    }
     res.json(results);
   } catch (err) { res.status(500).json({ msg: "Error fetching results" }); }
 });
@@ -253,9 +263,7 @@ app.post('/api/client/place-bet', async (req, res) => {
 
     await logStatement(user.username, 'BET PLACED', betCoins, `Prediction placed on ${market} (${type.toUpperCase()}: ${selectedDigit})`);
     res.json({ msg: "Prediction placed successfully!" });
-  } catch (err) {
-    res.status(500).json({ msg: "Server error processing prediction" });
-  }
+  } catch (err) { res.status(500).json({ msg: "Server error processing prediction" }); }
 });
 
 app.get('/api/client/pending-bets/:username', async (req, res) => {
