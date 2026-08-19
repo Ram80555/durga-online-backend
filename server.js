@@ -9,32 +9,18 @@ app.use(express.json());
 
 const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://ramdulare2411_db_user:rbQTRoDRPKuEDkMF@cluster0.pimwfzo.mongodb.net/durgaonline?retryWrites=true&w=majority";
 
-mongoose.connect(MONGO_URI)
-  .then(async () => {
-    console.log("MongoDB Database Connected Successfully");
-    try {
-      const superAdmin = await User.findOne({ username: 'Vikram16' });
-      if (!superAdmin) {
-        const newSuper = new User({
-          username: 'Vikram16',
-          password: 'Rajput8932@',
-          role: 'superadmin',
-          balance: 0,
-          upline: 0,
-          createdBy: 'system'
-        });
-        await newSuper.save();
-      } else {
-        superAdmin.password = 'Rajput8932@';
-        superAdmin.role = 'superadmin';
-        await superAdmin.save();
-      }
-    } catch(e) {}
-    MARKET_SCHEDULE.forEach(m => refreshDisplayPrice(m));
-  })
-  .catch(err => console.log("Mongo Error: ", err));
-
 // SCHEMAS
+const marketTimingSchema = new mongoose.Schema({
+  market: { type: String, required: true, unique: true },
+  symbol: { type: String, required: true },
+  flag: { type: String, default: '🌐' },
+  sub: { type: String, default: '' },
+  lockTime: { type: String, required: true }, // e.g. "11:30"
+  unlockTime: { type: String, required: true }, // e.g. "12:00"
+  settleTime: { type: String, required: true } // Auto +1 min e.g. "12:01"
+});
+const MarketTiming = mongoose.model('MarketTiming', marketTimingSchema);
+
 const userSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
   password: { type: String, required: true },
@@ -92,13 +78,51 @@ async function logStatement(username, type, coins, oldBalance, newBalance, remar
   } catch(e){}
 }
 
-const MARKET_SCHEDULE = [
-  { name: 'KOSPI', symbol: '^KS11', settleTime: '11:52' },
-  { name: 'HANG SENG', symbol: '^HSI', settleTime: '13:32' },
-  { name: 'SENSEX', symbol: '^BSESN', settleTime: '15:32' },
-  { name: 'DAX', symbol: '^GDAXI', settleTime: '22:02' },
-  { name: 'DOW JONES', symbol: '^DJI', settleTime: '01:32' }
+const DEFAULT_SCHEDULE = [
+  { market: 'KOSPI', symbol: '^KS11', flag: '🇰🇷', sub: 'Korea Composite Index', lockTime: '11:30', unlockTime: '12:00', settleTime: '12:01' },
+  { market: 'HANG SENG', symbol: '^HSI', flag: '🇭🇰', sub: 'Hong Kong', lockTime: '13:15', unlockTime: '13:45', settleTime: '13:46' },
+  { market: 'SENSEX', symbol: '^BSESN', flag: '🇮🇳', sub: 'India', lockTime: '15:00', unlockTime: '15:30', settleTime: '15:31' },
+  { market: 'DAX', symbol: '^GDAXI', flag: '🇩🇪', sub: 'Germany', lockTime: '21:30', unlockTime: '22:00', settleTime: '22:01' },
+  { market: 'DOW JONES', symbol: '^DJI', flag: '🇺🇸', sub: 'United States', lockTime: '01:30', unlockTime: '02:00', settleTime: '02:01' }
 ];
+
+async function seedDefaultTimings() {
+  for (let s of DEFAULT_SCHEDULE) {
+    const found = await MarketTiming.findOne({ market: s.market });
+    if (!found) {
+      const item = new MarketTiming(s);
+      await item.save();
+    }
+  }
+}
+
+mongoose.connect(MONGO_URI)
+  .then(async () => {
+    console.log("MongoDB Database Connected Successfully");
+    await seedDefaultTimings();
+    try {
+      const superAdmin = await User.findOne({ username: 'Vikram16' });
+      if (!superAdmin) {
+        const newSuper = new User({
+          username: 'Vikram16',
+          password: 'Rajput8932@',
+          role: 'superadmin',
+          balance: 0,
+          upline: 0,
+          createdBy: 'system'
+        });
+        await newSuper.save();
+      } else {
+        superAdmin.password = 'Rajput8932@';
+        superAdmin.role = 'superadmin';
+        await superAdmin.save();
+      }
+    } catch(e) {}
+    
+    const allTimings = await MarketTiming.find();
+    allTimings.forEach(m => refreshDisplayPrice(m));
+  })
+  .catch(err => console.log("Mongo Error: ", err));
 
 function fetchQuotePrice(symbol) {
   return new Promise((resolve, reject) => {
@@ -156,7 +180,7 @@ async function refreshDisplayPrice(m) {
     const singleDigitB = doubleDigit.slice(1, 2);
 
     await MarketResult.findOneAndUpdate(
-      { market: m.name },
+      { market: m.market || m.name },
       { 
         closingValue: priceFormatted, 
         change: data.change,
@@ -173,10 +197,14 @@ async function refreshDisplayPrice(m) {
   } catch (err) {}
 }
 
-setInterval(() => {
-  MARKET_SCHEDULE.forEach(m => refreshDisplayPrice(m));
+setInterval(async () => {
+  try {
+    const allTimings = await MarketTiming.find();
+    allTimings.forEach(m => refreshDisplayPrice(m));
+  } catch(e){}
 }, 30000);
 
+// AUTO SETTLE WITH DYNAMIC TIMINGS AND WEEKEND MONDAY RULE
 async function processMarketSettlement(m) {
   try {
     const now = new Date();
@@ -184,6 +212,7 @@ async function processMarketSettlement(m) {
     const istTime = new Date(now.getTime() + (now.getTimezoneOffset() * 60000) + istOffset);
     const dayOfWeek = istTime.getDay();
 
+    // Weekend bypass (Saturday=6, Sunday=0) -> Settle on Monday
     if (dayOfWeek === 0 || dayOfWeek === 6) return;
 
     const data = await fetchQuotePrice(m.symbol);
@@ -197,7 +226,7 @@ async function processMarketSettlement(m) {
     const singleDigitB = doubleDigit.slice(1, 2);
 
     await MarketResult.findOneAndUpdate(
-      { market: m.name },
+      { market: m.market },
       { 
         closingValue: priceFormatted, 
         change: data.change,
@@ -212,7 +241,7 @@ async function processMarketSettlement(m) {
       { upsert: true, new: true }
     );
 
-    const pendingBets = await Bet.find({ market: m.name, status: 'PENDING' });
+    const pendingBets = await Bet.find({ market: m.market, status: 'PENDING' });
 
     for (let b of pendingBets) {
       let isWin = false;
@@ -264,7 +293,7 @@ async function processMarketSettlement(m) {
 }
 
 let lastSettledMinute = '';
-setInterval(() => {
+setInterval(async () => {
   const now = new Date();
   const istOffset = 5.5 * 60 * 60 * 1000;
   const istTime = new Date(now.getTime() + (now.getTimezoneOffset() * 60000) + istOffset);
@@ -273,14 +302,59 @@ setInterval(() => {
   const currentTimeStr = `${curH}:${curM}`;
 
   if (lastSettledMinute !== currentTimeStr) {
-    MARKET_SCHEDULE.forEach(m => {
-      if (m.settleTime === currentTimeStr) {
-        lastSettledMinute = currentTimeStr;
-        processMarketSettlement(m);
-      }
-    });
+    try {
+      const allTimings = await MarketTiming.find();
+      allTimings.forEach(m => {
+        if (m.settleTime === currentTimeStr) {
+          lastSettledMinute = currentTimeStr;
+          processMarketSettlement(m);
+        }
+      });
+    } catch(e){}
   }
 }, 30000);
+
+// TIMING MANAGEMENT APIS
+app.get('/api/market/timings', async (req, res) => {
+  try {
+    const timings = await MarketTiming.find();
+    res.json(timings);
+  } catch (err) { res.status(500).json({ msg: "Error fetching timings" }); }
+});
+
+app.post('/api/superadmin/set-market-timing', async (req, res) => {
+  try {
+    const { superAdminUsername, market, lockTime, unlockTime } = req.body;
+    const superAdmin = await User.findOne({ username: superAdminUsername });
+    if (!superAdmin || (superAdmin.role !== 'superadmin' && superAdmin.username !== 'Vikram16')) {
+      return res.status(403).json({ msg: "Unauthorized! Only Super Admin can update market timing." });
+    }
+
+    if (!market || !lockTime || !unlockTime) {
+      return res.status(400).json({ msg: "Missing market timing parameters" });
+    }
+
+    // Auto compute settleTime (+1 minute after unlockTime)
+    const [uH, uM] = unlockTime.split(':').map(Number);
+    let sH = uH;
+    let sM = uM + 1;
+    if (sM >= 60) {
+      sM = 0;
+      sH = (sH + 1) % 24;
+    }
+    const settleTime = `${sH.toString().padStart(2, '0')}:${sM.toString().padStart(2, '0')}`;
+
+    const updated = await MarketTiming.findOneAndUpdate(
+      { market: market },
+      { lockTime, unlockTime, settleTime },
+      { new: true, upsert: true }
+    );
+
+    res.json({ msg: `Timing updated for ${market}! Settle Time set to ${settleTime}`, timing: updated });
+  } catch (err) {
+    res.status(500).json({ msg: "Server Error updating timing" });
+  }
+});
 
 // AUTH ENDPOINTS
 app.post('/api/auth/login', async (req, res) => {
@@ -363,6 +437,7 @@ app.get('/api/market/results', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Error fetching results" }); }
 });
 
+// PLACE BET WITH MARKET TIMING & BET-LOCK VERIFICATION
 app.post('/api/client/place-bet', async (req, res) => {
   try {
     const { username, userId, market, type, selectedDigit, coins } = req.body;
@@ -377,6 +452,35 @@ app.post('/api/client/place-bet', async (req, res) => {
 
     if (user.isBetLocked) {
       return res.status(403).json({ msg: "Betting has been LOCKED for your account by Admin!" });
+    }
+
+    // CHECK IF MARKET IS CURRENTLY IN LOCKED TIME INTERVAL
+    const now = new Date();
+    const istOffset = 5.5 * 60 * 60 * 1000;
+    const istTime = new Date(now.getTime() + (now.getTimezoneOffset() * 60000) + istOffset);
+    const dayOfWeek = istTime.getDay();
+
+    // Weekend is open for continuous placing
+    if (dayOfWeek !== 0 && dayOfWeek !== 6) {
+      const timing = await MarketTiming.findOne({ market: market });
+      if (timing) {
+        const curMins = istTime.getHours() * 60 + istTime.getMinutes();
+        const [lH, lM] = timing.lockTime.split(':').map(Number);
+        const lockMins = lH * 60 + lM;
+        const [uH, uM] = timing.unlockTime.split(':').map(Number);
+        const unlockMins = uH * 60 + uM;
+
+        let isLocked = false;
+        if (lockMins < unlockMins) {
+          isLocked = (curMins >= lockMins && curMins < unlockMins);
+        } else {
+          isLocked = (curMins >= lockMins || curMins < unlockMins);
+        }
+
+        if (isLocked) {
+          return res.status(400).json({ msg: `Market ${market} is currently LOCKED. Reopens at ${timing.unlockTime} IST.` });
+        }
+      }
     }
 
     const betCoins = Number(coins);
@@ -544,7 +648,7 @@ app.post('/api/superadmin/toggle-admin-bet-lock', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Server Error" }); }
 });
 
-// SUPER ADMIN MASTER RESET (WIPES ALL DATA & LEAVES ONLY SUPER ADMIN FRESH)
+// SUPER ADMIN MASTER RESET
 app.post('/api/superadmin/clear-all-data', async (req, res) => {
   try {
     const { superAdminUsername, password } = req.body;
@@ -557,16 +661,10 @@ app.post('/api/superadmin/clear-all-data', async (req, res) => {
       return res.status(400).json({ msg: "Invalid Super Admin Password! Verification Failed." });
     }
 
-    // 1. Delete all non-superadmin users (Admins + Clients)
     await User.deleteMany({ username: { $ne: superAdmin.username } });
-
-    // 2. Delete all bets
     await Bet.deleteMany({});
-
-    // 3. Delete all transaction statements
     await Statement.deleteMany({});
 
-    // 4. Reset Super Admin balance and upline to 0
     superAdmin.balance = 0;
     superAdmin.upline = 0;
     superAdmin.exposure = 0;
@@ -574,7 +672,7 @@ app.post('/api/superadmin/clear-all-data', async (req, res) => {
     superAdmin.isBetLocked = false;
     await superAdmin.save();
 
-    res.json({ msg: "ALL SYSTEM DATA WIPED SUCCESSFULLY! System is now fresh." });
+    res.json({ msg: "ALL SYSTEM DATA WIPED SUCCESSFULLY!" });
   } catch (err) {
     res.status(500).json({ msg: "Database Wipe Error: " + err.message });
   }
@@ -809,8 +907,9 @@ app.get('/api/admin/market-analysis/:adminUsername', async (req, res) => {
     const pendingBets = await Bet.find(betQuery);
 
     const analysis = {};
-    MARKET_SCHEDULE.forEach(m => {
-      analysis[m.name] = { totalBets: 0, totalCoins: 0, andarCoins: 0, baharCoins: 0, doubleCoins: 0 };
+    const allTimings = await MarketTiming.find();
+    allTimings.forEach(m => {
+      analysis[m.market] = { totalBets: 0, totalCoins: 0, andarCoins: 0, baharCoins: 0, doubleCoins: 0 };
     });
 
     pendingBets.forEach(b => {
