@@ -652,7 +652,7 @@ app.post('/api/admin/toggle-client-lock', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Server Error" }); }
 });
 
-// TOP PERFORMERS API (TOP ADMINS FOR SUPERADMIN, TOP CLIENTS FOR ADMIN)
+// TOP PERFORMERS
 app.get('/api/admin/top-performers/:adminUsername', async (req, res) => {
   try {
     const { adminUsername } = req.params;
@@ -669,7 +669,7 @@ app.get('/api/admin/top-performers/:adminUsername', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Error fetching top performers" }); }
 });
 
-// WEEKLY REPORT API (LAST 7 DAYS ACTIVITY)
+// WEEKLY REPORT
 app.get('/api/admin/weekly-report/:adminUsername', async (req, res) => {
   try {
     const { adminUsername } = req.params;
@@ -739,22 +739,11 @@ app.get('/api/admin/market-analysis/:adminUsername', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Error fetching market analysis" }); }
 });
 
+// ADMIN'S OWN STATEMENT (Dropdown statement shows ONLY Admin's direct activities)
 app.get('/api/admin/statements/:adminUsername', async (req, res) => {
   try {
     const { adminUsername } = req.params;
-    const admin = await User.findOne({ username: adminUsername });
-    if (!admin) return res.status(404).json({ msg: "Admin not found" });
-
-    if (admin.role === 'superadmin' || admin.username.toLowerCase() === 'vikram16') {
-      const logs = await Statement.find({ username: adminUsername }).sort({ timestamp: -1 }).limit(100);
-      return res.json(logs);
-    }
-
-    const myUsers = await User.find({ createdBy: adminUsername }).select('username');
-    const myUsernames = myUsers.map(u => u.username);
-    myUsernames.push(adminUsername);
-
-    const logs = await Statement.find({ username: { $in: myUsernames } }).sort({ timestamp: -1 }).limit(100);
+    const logs = await Statement.find({ username: adminUsername }).sort({ timestamp: -1 }).limit(100);
     res.json(logs);
   } catch (err) { res.status(500).json({ msg: "Error fetching statements" }); }
 });
