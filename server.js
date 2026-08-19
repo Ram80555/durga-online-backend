@@ -43,8 +43,8 @@ const userSchema = new mongoose.Schema({
   balance: { type: Number, default: 0 },
   upline: { type: Number, default: 0 },
   exposure: { type: Number, default: 0 },
-  isLocked: { type: Boolean, default: false }, // Account Login Lock
-  isBetLocked: { type: Boolean, default: false }, // Prediction / Betting Lock
+  isLocked: { type: Boolean, default: false },
+  isBetLocked: { type: Boolean, default: false },
   sessionToken: { type: String, default: '' }
 });
 const User = mongoose.model('User', userSchema);
@@ -363,7 +363,6 @@ app.get('/api/market/results', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Error fetching results" }); }
 });
 
-// PLACE BET WITH BET-LOCK CHECK
 app.post('/api/client/place-bet', async (req, res) => {
   try {
     const { username, userId, market, type, selectedDigit, coins } = req.body;
@@ -545,6 +544,42 @@ app.post('/api/superadmin/toggle-admin-bet-lock', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Server Error" }); }
 });
 
+// SUPER ADMIN MASTER RESET (WIPES ALL DATA & LEAVES ONLY SUPER ADMIN FRESH)
+app.post('/api/superadmin/clear-all-data', async (req, res) => {
+  try {
+    const { superAdminUsername, password } = req.body;
+    const superAdmin = await User.findOne({ username: superAdminUsername });
+    if (!superAdmin || (superAdmin.role !== 'superadmin' && superAdmin.username !== 'Vikram16')) {
+      return res.status(403).json({ msg: "Unauthorized! Only Super Admin can perform database wipe." });
+    }
+
+    if (superAdmin.password !== password) {
+      return res.status(400).json({ msg: "Invalid Super Admin Password! Verification Failed." });
+    }
+
+    // 1. Delete all non-superadmin users (Admins + Clients)
+    await User.deleteMany({ username: { $ne: superAdmin.username } });
+
+    // 2. Delete all bets
+    await Bet.deleteMany({});
+
+    // 3. Delete all transaction statements
+    await Statement.deleteMany({});
+
+    // 4. Reset Super Admin balance and upline to 0
+    superAdmin.balance = 0;
+    superAdmin.upline = 0;
+    superAdmin.exposure = 0;
+    superAdmin.isLocked = false;
+    superAdmin.isBetLocked = false;
+    await superAdmin.save();
+
+    res.json({ msg: "ALL SYSTEM DATA WIPED SUCCESSFULLY! System is now fresh." });
+  } catch (err) {
+    res.status(500).json({ msg: "Database Wipe Error: " + err.message });
+  }
+});
+
 // NORMAL ADMIN APIS
 app.post('/api/admin/create-client', async (req, res) => {
   try {
@@ -668,7 +703,6 @@ app.post('/api/admin/change-client-password', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Server Error" }); }
 });
 
-// STATUS TOGGLE (ACCOUNT LOGIN LOCK)
 app.post('/api/admin/toggle-client-lock', async (req, res) => {
   try {
     const { adminUsername, clientUsername } = req.body;
@@ -688,7 +722,6 @@ app.post('/api/admin/toggle-client-lock', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Server Error" }); }
 });
 
-// BET TOGGLE (BETTING PREDICTION LOCK)
 app.post('/api/admin/toggle-client-bet-lock', async (req, res) => {
   try {
     const { adminUsername, clientUsername } = req.body;
