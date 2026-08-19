@@ -15,9 +15,9 @@ const marketTimingSchema = new mongoose.Schema({
   symbol: { type: String, required: true },
   flag: { type: String, default: '🌐' },
   sub: { type: String, default: '' },
-  lockTime: { type: String, required: true }, // e.g. "11:30"
-  unlockTime: { type: String, required: true }, // e.g. "12:00"
-  settleTime: { type: String, required: true } // Auto +10 mins e.g. "12:10"
+  lockTime: { type: String, required: true },
+  unlockTime: { type: String, required: true },
+  settleTime: { type: String, required: true }
 });
 const MarketTiming = mongoose.model('MarketTiming', marketTimingSchema);
 
@@ -67,6 +67,7 @@ const resultSchema = new mongoose.Schema({
   singleDigitA: { type: String, default: '-' },
   singleDigitB: { type: String, default: '-' },
   doubleDigit: { type: String, default: '--' },
+  lastSettledDate: { type: String, default: '' },
   lastUpdated: { type: Date, default: Date.now }
 });
 const MarketResult = mongoose.model('MarketResult', resultSchema);
@@ -143,7 +144,7 @@ function fetchQuotePrice(symbol) {
             const resObj = json.chart.result[0];
             const meta = resObj.meta;
             const price = meta.regularMarketPrice || meta.chartPreviousClose || meta.previousClose;
-            const prevClose = meta.chartPreviousClose || meta.previousClose || price;
+            const prevClose = meta.chartPreviousClose || meta.previousClose || meta.regularMarketPreviousClose || price;
             const diff = price - prevClose;
             const pct = prevClose ? ((diff / prevClose) * 100).toFixed(2) : '0.00';
             
@@ -153,8 +154,15 @@ function fetchQuotePrice(symbol) {
             }
             const sparkline = rawQuotes.length > 0 ? rawQuotes.filter((_, idx) => idx % Math.max(1, Math.floor(rawQuotes.length / 25)) === 0) : [];
 
+            // Extract official previous closing digits if available
+            const prevCloseStr = Number(prevClose).toFixed(2);
+            const prevParts = prevCloseStr.split('.');
+            const officialPrevDouble = prevParts.length > 1 ? prevParts[1].padEnd(2, '0').slice(0, 2) : prevCloseStr.slice(-2);
+
             resolve({
               price: price,
+              prevClose: prevClose,
+              officialPrevDouble: officialPrevDouble,
               change: (diff >= 0 ? `+${diff.toFixed(2)}` : `${diff.toFixed(2)}`),
               percentChange: `${pct}%`,
               isPositive: diff >= 0,
@@ -167,31 +175,35 @@ function fetchQuotePrice(symbol) {
   });
 }
 
+// REGULAR LIVE REFRESH (UPDATES RATES & WAVES ONLY, PRESERVES FROZEN CLOSING DIGITS)
 async function refreshDisplayPrice(m) {
   try {
     const data = await fetchQuotePrice(m.symbol);
     if (!data || !data.price) return;
 
     const priceFormatted = Number(data.price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    const priceStr = Number(data.price).toFixed(2);
-    const parts = priceStr.split('.');
-    const doubleDigit = parts.length > 1 ? parts[1].padEnd(2, '0').slice(0, 2) : priceStr.slice(-2);
-    const singleDigitA = doubleDigit.slice(0, 1);
-    const singleDigitB = doubleDigit.slice(1, 2);
+    
+    // Check if initial double digit is needed for new database setup
+    const existing = await MarketResult.findOne({ market: m.market || m.name });
+    let updateFields = {
+      closingValue: priceFormatted, 
+      change: data.change,
+      percentChange: data.percentChange,
+      isPositive: data.isPositive,
+      sparkline: data.sparkline,
+      lastUpdated: new Date() 
+    };
+
+    if (!existing || existing.doubleDigit === '--') {
+      const initialDouble = data.officialPrevDouble || '00';
+      updateFields.doubleDigit = initialDouble;
+      updateFields.singleDigitA = initialDouble.slice(0, 1);
+      updateFields.singleDigitB = initialDouble.slice(1, 2);
+    }
 
     await MarketResult.findOneAndUpdate(
       { market: m.market || m.name },
-      { 
-        closingValue: priceFormatted, 
-        change: data.change,
-        percentChange: data.percentChange,
-        isPositive: data.isPositive,
-        sparkline: data.sparkline,
-        singleDigitA, 
-        singleDigitB, 
-        doubleDigit, 
-        lastUpdated: new Date() 
-      },
+      updateFields,
       { upsert: true, new: true }
     );
   } catch (err) {}
@@ -204,7 +216,7 @@ setInterval(async () => {
   } catch(e){}
 }, 30000);
 
-// AUTO SETTLE WITH DYNAMIC TIMINGS AND WEEKEND MONDAY RULE
+// OFFICIAL SETTLEMENT: TAKES SNAPSHOT AT EXACT SUPER ADMIN UNLOCK/SETTLE TIME
 async function processMarketSettlement(m) {
   try {
     const now = new Date();
@@ -212,6 +224,7 @@ async function processMarketSettlement(m) {
     const istTime = new Date(now.getTime() + (now.getTimezoneOffset() * 60000) + istOffset);
     const dayOfWeek = istTime.getDay();
 
+    // Weekend (Saturday=6, Sunday=0) bets carry over to Monday settlement
     if (dayOfWeek === 0 || dayOfWeek === 6) return;
 
     const data = await fetchQuotePrice(m.symbol);
@@ -224,6 +237,9 @@ async function processMarketSettlement(m) {
     const singleDigitA = doubleDigit.slice(0, 1);
     const singleDigitB = doubleDigit.slice(1, 2);
 
+    const todayDateStr = istTime.toISOString().slice(0, 10);
+
+    // Freeze official result for today
     await MarketResult.findOneAndUpdate(
       { market: m.market },
       { 
@@ -235,6 +251,7 @@ async function processMarketSettlement(m) {
         singleDigitA, 
         singleDigitB, 
         doubleDigit, 
+        lastSettledDate: todayDateStr,
         lastUpdated: new Date() 
       },
       { upsert: true, new: true }
@@ -313,7 +330,7 @@ setInterval(async () => {
   }
 }, 30000);
 
-// TIMING MANAGEMENT APIS (AUTO +10 MINS ON UNLOCK TIME)
+// TIMING MANAGEMENT APIS
 app.get('/api/market/timings', async (req, res) => {
   try {
     const timings = await MarketTiming.find();
@@ -333,7 +350,6 @@ app.post('/api/superadmin/set-market-timing', async (req, res) => {
       return res.status(400).json({ msg: "Missing market timing parameters" });
     }
 
-    // Auto compute settleTime (+10 minutes after unlockTime)
     const [uH, uM] = unlockTime.split(':').map(Number);
     let totalMinutes = uH * 60 + uM + 10;
     let sH = Math.floor(totalMinutes / 60) % 24;
@@ -433,7 +449,6 @@ app.get('/api/market/results', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Error fetching results" }); }
 });
 
-// PLACE BET WITH MARKET TIMING & BET-LOCK VERIFICATION
 app.post('/api/client/place-bet', async (req, res) => {
   try {
     const { username, userId, market, type, selectedDigit, coins } = req.body;
