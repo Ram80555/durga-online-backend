@@ -17,7 +17,7 @@ const marketTimingSchema = new mongoose.Schema({
   sub: { type: String, default: '' },
   lockTime: { type: String, required: true }, // e.g. "11:30"
   unlockTime: { type: String, required: true }, // e.g. "12:00"
-  settleTime: { type: String, required: true } // Auto +1 min e.g. "12:01"
+  settleTime: { type: String, required: true } // Auto +10 mins e.g. "12:10"
 });
 const MarketTiming = mongoose.model('MarketTiming', marketTimingSchema);
 
@@ -79,11 +79,11 @@ async function logStatement(username, type, coins, oldBalance, newBalance, remar
 }
 
 const DEFAULT_SCHEDULE = [
-  { market: 'KOSPI', symbol: '^KS11', flag: '🇰🇷', sub: 'Korea Composite Index', lockTime: '11:30', unlockTime: '12:00', settleTime: '12:01' },
-  { market: 'HANG SENG', symbol: '^HSI', flag: '🇭🇰', sub: 'Hong Kong', lockTime: '13:15', unlockTime: '13:45', settleTime: '13:46' },
-  { market: 'SENSEX', symbol: '^BSESN', flag: '🇮🇳', sub: 'India', lockTime: '15:00', unlockTime: '15:30', settleTime: '15:31' },
-  { market: 'DAX', symbol: '^GDAXI', flag: '🇩🇪', sub: 'Germany', lockTime: '21:30', unlockTime: '22:00', settleTime: '22:01' },
-  { market: 'DOW JONES', symbol: '^DJI', flag: '🇺🇸', sub: 'United States', lockTime: '01:30', unlockTime: '02:00', settleTime: '02:01' }
+  { market: 'KOSPI', symbol: '^KS11', flag: '🇰🇷', sub: 'Korea Composite Index', lockTime: '11:30', unlockTime: '12:00', settleTime: '12:10' },
+  { market: 'HANG SENG', symbol: '^HSI', flag: '🇭🇰', sub: 'Hong Kong', lockTime: '13:15', unlockTime: '13:45', settleTime: '13:55' },
+  { market: 'SENSEX', symbol: '^BSESN', flag: '🇮🇳', sub: 'India', lockTime: '15:00', unlockTime: '15:30', settleTime: '15:40' },
+  { market: 'DAX', symbol: '^GDAXI', flag: '🇩🇪', sub: 'Germany', lockTime: '21:30', unlockTime: '22:00', settleTime: '22:10' },
+  { market: 'DOW JONES', symbol: '^DJI', flag: '🇺🇸', sub: 'United States', lockTime: '01:30', unlockTime: '02:00', settleTime: '02:10' }
 ];
 
 async function seedDefaultTimings() {
@@ -212,7 +212,6 @@ async function processMarketSettlement(m) {
     const istTime = new Date(now.getTime() + (now.getTimezoneOffset() * 60000) + istOffset);
     const dayOfWeek = istTime.getDay();
 
-    // Weekend bypass (Saturday=6, Sunday=0) -> Settle on Monday
     if (dayOfWeek === 0 || dayOfWeek === 6) return;
 
     const data = await fetchQuotePrice(m.symbol);
@@ -314,7 +313,7 @@ setInterval(async () => {
   }
 }, 30000);
 
-// TIMING MANAGEMENT APIS
+// TIMING MANAGEMENT APIS (AUTO +10 MINS ON UNLOCK TIME)
 app.get('/api/market/timings', async (req, res) => {
   try {
     const timings = await MarketTiming.find();
@@ -334,14 +333,11 @@ app.post('/api/superadmin/set-market-timing', async (req, res) => {
       return res.status(400).json({ msg: "Missing market timing parameters" });
     }
 
-    // Auto compute settleTime (+1 minute after unlockTime)
+    // Auto compute settleTime (+10 minutes after unlockTime)
     const [uH, uM] = unlockTime.split(':').map(Number);
-    let sH = uH;
-    let sM = uM + 1;
-    if (sM >= 60) {
-      sM = 0;
-      sH = (sH + 1) % 24;
-    }
+    let totalMinutes = uH * 60 + uM + 10;
+    let sH = Math.floor(totalMinutes / 60) % 24;
+    let sM = totalMinutes % 60;
     const settleTime = `${sH.toString().padStart(2, '0')}:${sM.toString().padStart(2, '0')}`;
 
     const updated = await MarketTiming.findOneAndUpdate(
@@ -350,7 +346,7 @@ app.post('/api/superadmin/set-market-timing', async (req, res) => {
       { new: true, upsert: true }
     );
 
-    res.json({ msg: `Timing updated for ${market}! Settle Time set to ${settleTime}`, timing: updated });
+    res.json({ msg: `Timing updated for ${market}! Settle Time set to ${settleTime} IST (+10 mins)`, timing: updated });
   } catch (err) {
     res.status(500).json({ msg: "Server Error updating timing" });
   }
@@ -454,13 +450,11 @@ app.post('/api/client/place-bet', async (req, res) => {
       return res.status(403).json({ msg: "Betting has been LOCKED for your account by Admin!" });
     }
 
-    // CHECK IF MARKET IS CURRENTLY IN LOCKED TIME INTERVAL
     const now = new Date();
     const istOffset = 5.5 * 60 * 60 * 1000;
     const istTime = new Date(now.getTime() + (now.getTimezoneOffset() * 60000) + istOffset);
     const dayOfWeek = istTime.getDay();
 
-    // Weekend is open for continuous placing
     if (dayOfWeek !== 0 && dayOfWeek !== 6) {
       const timing = await MarketTiming.findOne({ market: market });
       if (timing) {
