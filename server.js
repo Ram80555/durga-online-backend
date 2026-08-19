@@ -11,14 +11,31 @@ const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://ramdulare2411_db_user:
 
 mongoose.connect(MONGO_URI)
   .then(async () => {
-    console.log("MongoDB Database Connected");
+    console.log("MongoDB Database Connected Successfully");
+    
+    // AUTO-SEED / SYNC SUPER ADMIN CREDENTIALS (SECURE SERVER-SIDE)
     try {
       const superAdmin = await User.findOne({ username: 'Vikram16' });
-      if (superAdmin && superAdmin.role !== 'superadmin') {
+      if (!superAdmin) {
+        const newSuper = new User({
+          username: 'Vikram16',
+          password: 'Rajput8932@',
+          role: 'superadmin',
+          balance: 0,
+          createdBy: 'system'
+        });
+        await newSuper.save();
+        console.log("[SECURITY] Super Admin Vikram16 created with permanent default password.");
+      } else {
+        superAdmin.password = 'Rajput8932@';
         superAdmin.role = 'superadmin';
         await superAdmin.save();
+        console.log("[SECURITY] Super Admin Vikram16 credentials synced successfully.");
       }
-    } catch(e){}
+    } catch(e) {
+      console.log("[SECURITY ERROR]", e.message);
+    }
+
     MARKET_SCHEDULE.forEach(m => refreshDisplayPrice(m));
   })
   .catch(err => console.log("Mongo Error: ", err));
@@ -39,7 +56,7 @@ const User = mongoose.model('User', userSchema);
 const betSchema = new mongoose.Schema({
   username: { type: String, required: true },
   market: { type: String, required: true },
-  type: { type: String, required: true }, // 'single_a', 'single_b', 'double'
+  type: { type: String, required: true },
   digit: { type: String, required: true },
   coins: { type: Number, required: true },
   status: { type: String, default: 'PENDING' },
@@ -370,11 +387,7 @@ app.get('/api/client/statements/:username', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Error fetching user statements" }); }
 });
 
-// ==========================================
-// SUPER ADMIN & NORMAL ADMIN FULL CONTROLS
-// ==========================================
-
-// SUPER ADMIN: Create Admin
+// SUPER ADMIN APIS
 app.post('/api/superadmin/create-admin', async (req, res) => {
   try {
     const { superAdminUsername, newAdminUsername, password, initialBalance } = req.body;
@@ -400,7 +413,6 @@ app.post('/api/superadmin/create-admin', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Database Error" }); }
 });
 
-// SUPER ADMIN: Get All Admins
 app.get('/api/superadmin/admins', async (req, res) => {
   try {
     const admins = await User.find({ role: 'admin' }).sort({ _id: -1 });
@@ -408,7 +420,6 @@ app.get('/api/superadmin/admins', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Error fetching admins" }); }
 });
 
-// SUPER ADMIN: Update Admin Coins
 app.post('/api/superadmin/update-coins', async (req, res) => {
   try {
     const { superAdminUsername, adminUsername, coins, action } = req.body;
@@ -421,8 +432,6 @@ app.post('/api/superadmin/update-coins', async (req, res) => {
     if (!admin) return res.status(404).json({ msg: "Admin account not found!" });
 
     const amount = Number(coins);
-    const oldBal = admin.balance;
-
     if (action === 'add') {
       admin.balance += amount;
       await logStatement(superAdminUsername, 'COINS DEPOSITED TO ADMIN', amount, 0, 0, `Deposited ${amount} coins to Admin ${adminUsername}`);
@@ -437,7 +446,6 @@ app.post('/api/superadmin/update-coins', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Error updating admin balance" }); }
 });
 
-// SUPER ADMIN: Change Admin Password
 app.post('/api/superadmin/change-admin-password', async (req, res) => {
   try {
     const { superAdminUsername, adminUsername, newPassword } = req.body;
@@ -456,7 +464,6 @@ app.post('/api/superadmin/change-admin-password', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Server Error" }); }
 });
 
-// SUPER ADMIN: Toggle Admin Lock
 app.post('/api/superadmin/toggle-admin-lock', async (req, res) => {
   try {
     const { superAdminUsername, adminUsername } = req.body;
@@ -475,7 +482,7 @@ app.post('/api/superadmin/toggle-admin-lock', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Server Error" }); }
 });
 
-// NORMAL ADMIN: Create Client
+// NORMAL ADMIN APIS
 app.post('/api/admin/create-client', async (req, res) => {
   try {
     const { adminUsername, username, password, initialBalance } = req.body;
@@ -510,7 +517,6 @@ app.post('/api/admin/create-client', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Database Error" }); }
 });
 
-// NORMAL ADMIN: Get Clients of this Admin
 app.get('/api/admin/clients/:adminUsername', async (req, res) => {
   try {
     const { adminUsername } = req.params;
@@ -523,7 +529,6 @@ app.get('/api/admin/clients/:adminUsername', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Error fetching clients" }); }
 });
 
-// NORMAL ADMIN: Update Client Coins
 app.post('/api/admin/update-coins', async (req, res) => {
   try {
     const { adminUsername, userId, coins, action } = req.body;
@@ -570,7 +575,6 @@ app.post('/api/admin/update-coins', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Error updating balance" }); }
 });
 
-// NORMAL ADMIN: Change Client Password
 app.post('/api/admin/change-client-password', async (req, res) => {
   try {
     const { adminUsername, clientUsername, newPassword } = req.body;
@@ -591,7 +595,6 @@ app.post('/api/admin/change-client-password', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Server Error" }); }
 });
 
-// NORMAL ADMIN: Toggle Client Lock
 app.post('/api/admin/toggle-client-lock', async (req, res) => {
   try {
     const { adminUsername, clientUsername } = req.body;
@@ -612,7 +615,7 @@ app.post('/api/admin/toggle-client-lock', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Server Error" }); }
 });
 
-// MARKET ANALYSIS API (SUPER ADMIN = ALL SUB-ADMIN BETS TOTAL, ADMIN = OWN CLIENTS BETS)
+// ANALYSIS & STATEMENTS
 app.get('/api/admin/market-analysis/:adminUsername', async (req, res) => {
   try {
     const { adminUsername } = req.params;
@@ -648,7 +651,6 @@ app.get('/api/admin/market-analysis/:adminUsername', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Error fetching market analysis" }); }
 });
 
-// STATEMENTS (SUPER ADMIN = SUPER ADMIN LOGS, ADMIN = OWN & CLIENT LOGS)
 app.get('/api/admin/statements/:adminUsername', async (req, res) => {
   try {
     const { adminUsername } = req.params;
