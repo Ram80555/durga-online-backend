@@ -43,7 +43,8 @@ const userSchema = new mongoose.Schema({
   balance: { type: Number, default: 0 },
   upline: { type: Number, default: 0 },
   exposure: { type: Number, default: 0 },
-  isLocked: { type: Boolean, default: false },
+  isLocked: { type: Boolean, default: false }, // Account Login Lock
+  isBetLocked: { type: Boolean, default: false }, // Prediction / Betting Lock
   sessionToken: { type: String, default: '' }
 });
 const User = mongoose.model('User', userSchema);
@@ -305,6 +306,8 @@ app.post('/api/auth/login', async (req, res) => {
         balance: user.balance,
         upline: user.upline || 0,
         exposure: user.exposure,
+        isLocked: user.isLocked || false,
+        isBetLocked: user.isBetLocked || false,
         sessionToken: newToken
       }
     });
@@ -334,6 +337,8 @@ app.post('/api/auth/verify-session', async (req, res) => {
       totalBal: totalCirculatingBal,
       upline: calculatedUpline, 
       exposure: user.exposure, 
+      isLocked: user.isLocked || false,
+      isBetLocked: user.isBetLocked || false,
       role: user.role 
     });
   } catch (err) { res.status(500).json({ valid: false }); }
@@ -358,6 +363,7 @@ app.get('/api/market/results', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Error fetching results" }); }
 });
 
+// PLACE BET WITH BET-LOCK CHECK
 app.post('/api/client/place-bet', async (req, res) => {
   try {
     const { username, userId, market, type, selectedDigit, coins } = req.body;
@@ -369,6 +375,10 @@ app.post('/api/client/place-bet', async (req, res) => {
 
     const user = await User.findOne({ $or: [{ username: targetUser }, { _id: mongoose.Types.ObjectId.isValid(targetUser) ? targetUser : null }] });
     if (!user) return res.status(404).json({ msg: "User account not found!" });
+
+    if (user.isBetLocked) {
+      return res.status(403).json({ msg: "Betting has been LOCKED for your account by Admin!" });
+    }
 
     const betCoins = Number(coins);
     if (user.balance < betCoins) {
@@ -439,9 +449,7 @@ app.post('/api/superadmin/create-admin', async (req, res) => {
     });
     await newAdmin.save();
     
-    // Superadmin logs (shows Admin name in Superadmin log only)
     await logStatement(superAdminUsername, 'ADMIN CREATED', coins, 0, 0, `Created Admin ${cleanUsername} with ${coins} coins.`);
-    // New Admin logs (clean)
     await logStatement(cleanUsername, 'INITIAL BALANCE', coins, 0, coins, `Initial chips allocated.`);
     
     res.json({ msg: `Admin ${cleanUsername} created successfully!` });
@@ -516,12 +524,28 @@ app.post('/api/superadmin/toggle-admin-lock', async (req, res) => {
 
     admin.isLocked = !admin.isLocked;
     await admin.save();
-    await logStatement(superAdminUsername, admin.isLocked ? 'ADMIN LOCKED' : 'ADMIN UNLOCKED', 0, 0, 0, `${admin.isLocked ? 'Locked' : 'Unlocked'} Admin ${adminUsername}`);
-    res.json({ msg: `Admin ${adminUsername} is now ${admin.isLocked ? 'LOCKED' : 'ACTIVE'}` });
+    res.json({ msg: `Admin ${adminUsername} Status is now ${admin.isLocked ? 'LOCKED' : 'ACTIVE'}`, isLocked: admin.isLocked });
   } catch (err) { res.status(500).json({ msg: "Server Error" }); }
 });
 
-// NORMAL ADMIN APIS (NO ADMIN NAME IN CLIENT LOGS)
+app.post('/api/superadmin/toggle-admin-bet-lock', async (req, res) => {
+  try {
+    const { superAdminUsername, adminUsername } = req.body;
+    const superAdmin = await User.findOne({ username: superAdminUsername });
+    if (!superAdmin || (superAdmin.role !== 'superadmin' && superAdmin.username !== 'Vikram16')) {
+      return res.status(403).json({ msg: "Unauthorized!" });
+    }
+
+    const admin = await User.findOne({ username: adminUsername, role: 'admin' });
+    if (!admin) return res.status(404).json({ msg: "Admin not found!" });
+
+    admin.isBetLocked = !admin.isBetLocked;
+    await admin.save();
+    res.json({ msg: `Admin ${adminUsername} Bet is now ${admin.isBetLocked ? 'LOCKED' : 'ACTIVE'}`, isBetLocked: admin.isBetLocked });
+  } catch (err) { res.status(500).json({ msg: "Server Error" }); }
+});
+
+// NORMAL ADMIN APIS
 app.post('/api/admin/create-client', async (req, res) => {
   try {
     const { adminUsername, username, password, initialBalance } = req.body;
@@ -547,7 +571,6 @@ app.post('/api/admin/create-client', async (req, res) => {
       }
       admin.balance -= coins;
       await admin.save();
-      // Admin Self Statement (Admin sees who was created)
       await logStatement(admin.username, 'CLIENT CREATED', coins, admin.balance + coins, admin.balance, `Created client ${cleanUsername} with ${coins} coins`);
     }
 
@@ -556,11 +579,12 @@ app.post('/api/admin/create-client', async (req, res) => {
       password: password.trim(),
       role: 'client',
       createdBy: adminUsername,
-      balance: coins
+      balance: coins,
+      isLocked: false,
+      isBetLocked: false
     });
     await newUser.save();
 
-    // Client Statement (CLEAN REMARK WITHOUT ADMIN USERNAME)
     await logStatement(cleanUsername, 'ACCOUNT CREATED', coins, 0, coins, 'Initial chips credited on registration.');
     res.json({ msg: `Client ${cleanUsername} created successfully!` });
   } catch (err) { res.status(500).json({ msg: "Database Error" }); }
@@ -601,12 +625,10 @@ app.post('/api/admin/update-coins', async (req, res) => {
         }
         admin.balance -= amount;
         await admin.save();
-        // Admin log
         await logStatement(admin.username, 'DEPOSITED TO CLIENT', amount, admin.balance + amount, admin.balance, `Transferred ${amount} C to ${user.username}`);
       }
 
       user.balance += amount;
-      // Client log (Clean, no admin name)
       await logStatement(user.username, 'DEPOSIT', amount, oldClientBal, user.balance, 'Coins successfully deposited to wallet.');
     } else if (action === 'withdraw') {
       if (user.balance < amount) return res.status(400).json({ msg: "Client balance is insufficient to withdraw!" });
@@ -615,11 +637,9 @@ app.post('/api/admin/update-coins', async (req, res) => {
       if (admin.role === 'admin') {
         admin.balance += amount;
         await admin.save();
-        // Admin log
         await logStatement(admin.username, 'WITHDRAWN FROM CLIENT', amount, admin.balance - amount, admin.balance, `Withdrew ${amount} C from ${user.username}`);
       }
 
-      // Client log (Clean, no admin name)
       await logStatement(user.username, 'WITHDRAW', amount, oldClientBal, user.balance, 'Coins debited from wallet.');
     }
 
@@ -648,6 +668,7 @@ app.post('/api/admin/change-client-password', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Server Error" }); }
 });
 
+// STATUS TOGGLE (ACCOUNT LOGIN LOCK)
 app.post('/api/admin/toggle-client-lock', async (req, res) => {
   try {
     const { adminUsername, clientUsername } = req.body;
@@ -663,8 +684,27 @@ app.post('/api/admin/toggle-client-lock', async (req, res) => {
 
     client.isLocked = !client.isLocked;
     await client.save();
-    await logStatement(adminUsername, client.isLocked ? 'CLIENT LOCKED' : 'CLIENT UNLOCKED', 0, 0, 0, `${client.isLocked ? 'Locked' : 'Unlocked'} client ${clientUsername}`);
-    res.json({ msg: `Client ${clientUsername} is now ${client.isLocked ? 'LOCKED' : 'ACTIVE'}` });
+    res.json({ msg: `Client ${clientUsername} Status is now ${client.isLocked ? 'LOCKED' : 'ACTIVE'}`, isLocked: client.isLocked });
+  } catch (err) { res.status(500).json({ msg: "Server Error" }); }
+});
+
+// BET TOGGLE (BETTING PREDICTION LOCK)
+app.post('/api/admin/toggle-client-bet-lock', async (req, res) => {
+  try {
+    const { adminUsername, clientUsername } = req.body;
+    const admin = await User.findOne({ username: adminUsername });
+    if (!admin) return res.status(403).json({ msg: "Unauthorized!" });
+
+    const client = await User.findOne({ username: clientUsername, role: 'client' });
+    if (!client) return res.status(404).json({ msg: "Client not found!" });
+
+    if (admin.role !== 'superadmin' && admin.username.toLowerCase() !== 'vikram16' && client.createdBy !== adminUsername) {
+      return res.status(403).json({ msg: "Unauthorized! You can only manage your own clients." });
+    }
+
+    client.isBetLocked = !client.isBetLocked;
+    await client.save();
+    res.json({ msg: `Client ${clientUsername} Bet is now ${client.isBetLocked ? 'LOCKED' : 'ACTIVE'}`, isBetLocked: client.isBetLocked });
   } catch (err) { res.status(500).json({ msg: "Server Error" }); }
 });
 
@@ -755,7 +795,7 @@ app.get('/api/admin/market-analysis/:adminUsername', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Error fetching market analysis" }); }
 });
 
-// ADMIN'S OWN STATEMENT (ONLY DIRECT ADMIN ACTIONS)
+// ADMIN DIRECT LOGS
 app.get('/api/admin/statements/:adminUsername', async (req, res) => {
   try {
     const { adminUsername } = req.params;
