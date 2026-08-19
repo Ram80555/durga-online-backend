@@ -438,7 +438,12 @@ app.post('/api/superadmin/create-admin', async (req, res) => {
       upline: 0
     });
     await newAdmin.save();
+    
+    // Superadmin logs (shows Admin name in Superadmin log only)
     await logStatement(superAdminUsername, 'ADMIN CREATED', coins, 0, 0, `Created Admin ${cleanUsername} with ${coins} coins.`);
+    // New Admin logs (clean)
+    await logStatement(cleanUsername, 'INITIAL BALANCE', coins, 0, coins, `Initial chips allocated.`);
+    
     res.json({ msg: `Admin ${cleanUsername} created successfully!` });
   } catch (err) { res.status(500).json({ msg: "Database Error" }); }
 });
@@ -462,13 +467,17 @@ app.post('/api/superadmin/update-coins', async (req, res) => {
     if (!admin) return res.status(404).json({ msg: "Admin account not found!" });
 
     const amount = Number(coins);
+    const oldBal = admin.balance;
+
     if (action === 'add') {
       admin.balance += amount;
       await logStatement(superAdminUsername, 'COINS DEPOSITED TO ADMIN', amount, 0, 0, `Deposited ${amount} coins to Admin ${adminUsername}`);
+      await logStatement(admin.username, 'DEPOSIT', amount, oldBal, admin.balance, `Coins credited to wallet.`);
     } else if (action === 'withdraw') {
       if (admin.balance < amount) return res.status(400).json({ msg: "Admin balance is insufficient to withdraw!" });
       admin.balance -= amount;
       await logStatement(superAdminUsername, 'COINS WITHDRAWN FROM ADMIN', amount, 0, 0, `Withdrew ${amount} coins from Admin ${adminUsername}`);
+      await logStatement(admin.username, 'WITHDRAW', amount, oldBal, admin.balance, `Coins debited from wallet.`);
     }
 
     await admin.save();
@@ -512,7 +521,7 @@ app.post('/api/superadmin/toggle-admin-lock', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Server Error" }); }
 });
 
-// NORMAL ADMIN APIS
+// NORMAL ADMIN APIS (NO ADMIN NAME IN CLIENT LOGS)
 app.post('/api/admin/create-client', async (req, res) => {
   try {
     const { adminUsername, username, password, initialBalance } = req.body;
@@ -538,6 +547,7 @@ app.post('/api/admin/create-client', async (req, res) => {
       }
       admin.balance -= coins;
       await admin.save();
+      // Admin Self Statement (Admin sees who was created)
       await logStatement(admin.username, 'CLIENT CREATED', coins, admin.balance + coins, admin.balance, `Created client ${cleanUsername} with ${coins} coins`);
     }
 
@@ -549,7 +559,9 @@ app.post('/api/admin/create-client', async (req, res) => {
       balance: coins
     });
     await newUser.save();
-    await logStatement(cleanUsername, 'ACCOUNT CREATED', coins, 0, coins, `Created by Admin ${adminUsername}`);
+
+    // Client Statement (CLEAN REMARK WITHOUT ADMIN USERNAME)
+    await logStatement(cleanUsername, 'ACCOUNT CREATED', coins, 0, coins, 'Initial chips credited on registration.');
     res.json({ msg: `Client ${cleanUsername} created successfully!` });
   } catch (err) { res.status(500).json({ msg: "Database Error" }); }
 });
@@ -589,11 +601,13 @@ app.post('/api/admin/update-coins', async (req, res) => {
         }
         admin.balance -= amount;
         await admin.save();
+        // Admin log
         await logStatement(admin.username, 'DEPOSITED TO CLIENT', amount, admin.balance + amount, admin.balance, `Transferred ${amount} C to ${user.username}`);
       }
 
       user.balance += amount;
-      await logStatement(user.username, 'ADMIN DEPOSIT', amount, oldClientBal, user.balance, `Admin ${adminUsername} deposited ${amount} coins.`);
+      // Client log (Clean, no admin name)
+      await logStatement(user.username, 'DEPOSIT', amount, oldClientBal, user.balance, 'Coins successfully deposited to wallet.');
     } else if (action === 'withdraw') {
       if (user.balance < amount) return res.status(400).json({ msg: "Client balance is insufficient to withdraw!" });
 
@@ -601,10 +615,12 @@ app.post('/api/admin/update-coins', async (req, res) => {
       if (admin.role === 'admin') {
         admin.balance += amount;
         await admin.save();
+        // Admin log
         await logStatement(admin.username, 'WITHDRAWN FROM CLIENT', amount, admin.balance - amount, admin.balance, `Withdrew ${amount} C from ${user.username}`);
       }
 
-      await logStatement(user.username, 'ADMIN WITHDRAW', amount, oldClientBal, user.balance, `Admin ${adminUsername} withdrew ${amount} coins.`);
+      // Client log (Clean, no admin name)
+      await logStatement(user.username, 'WITHDRAW', amount, oldClientBal, user.balance, 'Coins debited from wallet.');
     }
 
     await user.save();
@@ -703,7 +719,7 @@ app.get('/api/admin/weekly-report/:adminUsername', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Error fetching weekly report" }); }
 });
 
-// ANALYSIS & STATEMENTS
+// ANALYSIS
 app.get('/api/admin/market-analysis/:adminUsername', async (req, res) => {
   try {
     const { adminUsername } = req.params;
@@ -739,7 +755,7 @@ app.get('/api/admin/market-analysis/:adminUsername', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Error fetching market analysis" }); }
 });
 
-// ADMIN'S OWN STATEMENT (Dropdown statement shows ONLY Admin's direct activities)
+// ADMIN'S OWN STATEMENT (ONLY DIRECT ADMIN ACTIONS)
 app.get('/api/admin/statements/:adminUsername', async (req, res) => {
   try {
     const { adminUsername } = req.params;
