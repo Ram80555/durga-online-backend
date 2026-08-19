@@ -10,8 +10,15 @@ app.use(express.json());
 const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://ramdulare2411_db_user:rbQTRoDRPKuEDkMF@cluster0.pimwfzo.mongodb.net/durgaonline?retryWrites=true&w=majority";
 
 mongoose.connect(MONGO_URI)
-  .then(() => {
-    console.log("MongoDB Connected");
+  .then(async () => {
+    console.log("MongoDB Database Connected");
+    try {
+      const superAdmin = await User.findOne({ username: 'Vikram16' });
+      if (superAdmin && superAdmin.role !== 'superadmin') {
+        superAdmin.role = 'superadmin';
+        await superAdmin.save();
+      }
+    } catch(e){}
     MARKET_SCHEDULE.forEach(m => refreshDisplayPrice(m));
   })
   .catch(err => console.log("Mongo Error: ", err));
@@ -20,7 +27,8 @@ mongoose.connect(MONGO_URI)
 const userSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
   password: { type: String, required: true },
-  role: { type: String, default: 'client' },
+  role: { type: String, default: 'client' }, // 'superadmin', 'admin', 'client'
+  createdBy: { type: String, default: 'system' },
   balance: { type: Number, default: 0 },
   exposure: { type: Number, default: 0 },
   isLocked: { type: Boolean, default: false },
@@ -79,7 +87,6 @@ const MARKET_SCHEDULE = [
   { name: 'DOW JONES', symbol: '^DJI', settleTime: '01:32' }
 ];
 
-// FETCH REAL-TIME INTRADAY DATA WITH SPARKLINE SERIES
 function fetchQuotePrice(symbol) {
   return new Promise((resolve, reject) => {
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=1d&interval=5m`;
@@ -103,12 +110,10 @@ function fetchQuotePrice(symbol) {
             const diff = price - prevClose;
             const pct = prevClose ? ((diff / prevClose) * 100).toFixed(2) : '0.00';
             
-            // Extract raw intraday close prices for real wave graph
             let rawQuotes = [];
             if (resObj.indicators && resObj.indicators.quote && resObj.indicators.quote[0] && resObj.indicators.quote[0].close) {
               rawQuotes = resObj.indicators.quote[0].close.filter(p => p !== null && !isNaN(p));
             }
-            // Sample down to 20-30 data points for responsive chart
             const sparkline = rawQuotes.length > 0 ? rawQuotes.filter((_, idx) => idx % Math.max(1, Math.floor(rawQuotes.length / 25)) === 0) : [];
 
             resolve({
@@ -125,7 +130,6 @@ function fetchQuotePrice(symbol) {
   });
 }
 
-// REFRESH REAL LIVE RATES & STATS
 async function refreshDisplayPrice(m) {
   try {
     const data = await fetchQuotePrice(m.symbol);
@@ -160,7 +164,6 @@ setInterval(() => {
   MARKET_SCHEDULE.forEach(m => refreshDisplayPrice(m));
 }, 30000);
 
-// AUTO SETTLE PROCESS
 async function processMarketSettlement(m) {
   try {
     const now = new Date();
@@ -264,6 +267,10 @@ app.post('/api/auth/login', async (req, res) => {
     if (!user) return res.status(400).json({ msg: "Invalid Username or Password!" });
     if (user.isLocked) return res.status(403).json({ msg: "Account is LOCKED by Admin!" });
 
+    if (user.username === 'Vikram16' && user.role !== 'superadmin') {
+      user.role = 'superadmin';
+    }
+
     const newToken = Date.now().toString() + Math.random().toString(36).substring(2);
     user.sessionToken = newToken;
     await user.save();
@@ -288,7 +295,7 @@ app.post('/api/auth/verify-session', async (req, res) => {
     if (!user || user.sessionToken !== sessionToken) {
       return res.status(401).json({ valid: false, msg: "Logged in from another device!" });
     }
-    res.json({ valid: true, balance: user.balance, exposure: user.exposure });
+    res.json({ valid: true, balance: user.balance, exposure: user.exposure, role: user.role });
   } catch (err) { res.status(500).json({ valid: false }); }
 });
 
@@ -363,52 +370,301 @@ app.get('/api/client/statements/:username', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Error fetching user statements" }); }
 });
 
-app.post('/api/admin/create-client', async (req, res) => {
+// ==========================================
+// SUPER ADMIN & NORMAL ADMIN FULL CONTROLS
+// ==========================================
+
+// SUPER ADMIN: Create Admin
+app.post('/api/superadmin/create-admin', async (req, res) => {
   try {
-    const { username, password, initialBalance } = req.body;
-    const existing = await User.findOne({ username });
-    if (existing) return res.status(400).json({ msg: "User already exists!" });
+    const { superAdminUsername, newAdminUsername, password, initialBalance } = req.body;
+    const superAdmin = await User.findOne({ username: superAdminUsername });
+    if (!superAdmin || (superAdmin.role !== 'superadmin' && superAdmin.username !== 'Vikram16')) {
+      return res.status(403).json({ msg: "Unauthorized! Only Super Admin can create admins." });
+    }
+
+    const existing = await User.findOne({ username: newAdminUsername });
+    if (existing) return res.status(400).json({ msg: "Admin username already exists!" });
 
     const coins = Number(initialBalance) || 0;
-    const newUser = new User({ username, password, role: 'client', balance: coins });
+    const newAdmin = new User({
+      username: newAdminUsername,
+      password: password,
+      role: 'admin',
+      createdBy: superAdminUsername,
+      balance: coins
+    });
+    await newAdmin.save();
+    await logStatement(superAdminUsername, 'ADMIN CREATED', coins, 0, 0, `Created Admin ${newAdminUsername} with ${coins} coins.`);
+    res.json({ msg: `Admin ${newAdminUsername} created successfully!` });
+  } catch (err) { res.status(500).json({ msg: "Database Error" }); }
+});
+
+// SUPER ADMIN: Get All Admins
+app.get('/api/superadmin/admins', async (req, res) => {
+  try {
+    const admins = await User.find({ role: 'admin' }).sort({ _id: -1 });
+    res.json(admins);
+  } catch (err) { res.status(500).json({ msg: "Error fetching admins" }); }
+});
+
+// SUPER ADMIN: Update Admin Coins
+app.post('/api/superadmin/update-coins', async (req, res) => {
+  try {
+    const { superAdminUsername, adminUsername, coins, action } = req.body;
+    const superAdmin = await User.findOne({ username: superAdminUsername });
+    if (!superAdmin || (superAdmin.role !== 'superadmin' && superAdmin.username !== 'Vikram16')) {
+      return res.status(403).json({ msg: "Unauthorized!" });
+    }
+
+    const admin = await User.findOne({ username: adminUsername, role: 'admin' });
+    if (!admin) return res.status(404).json({ msg: "Admin account not found!" });
+
+    const amount = Number(coins);
+    const oldBal = admin.balance;
+
+    if (action === 'add') {
+      admin.balance += amount;
+      await logStatement(superAdminUsername, 'COINS DEPOSITED TO ADMIN', amount, 0, 0, `Deposited ${amount} coins to Admin ${adminUsername}`);
+    } else if (action === 'withdraw') {
+      if (admin.balance < amount) return res.status(400).json({ msg: "Admin balance is insufficient to withdraw!" });
+      admin.balance -= amount;
+      await logStatement(superAdminUsername, 'COINS WITHDRAWN FROM ADMIN', amount, 0, 0, `Withdrew ${amount} coins from Admin ${adminUsername}`);
+    }
+
+    await admin.save();
+    res.json({ msg: `Admin ${adminUsername} balance updated: ${admin.balance} C` });
+  } catch (err) { res.status(500).json({ msg: "Error updating admin balance" }); }
+});
+
+// SUPER ADMIN: Change Admin Password
+app.post('/api/superadmin/change-admin-password', async (req, res) => {
+  try {
+    const { superAdminUsername, adminUsername, newPassword } = req.body;
+    const superAdmin = await User.findOne({ username: superAdminUsername });
+    if (!superAdmin || (superAdmin.role !== 'superadmin' && superAdmin.username !== 'Vikram16')) {
+      return res.status(403).json({ msg: "Unauthorized!" });
+    }
+
+    const admin = await User.findOne({ username: adminUsername, role: 'admin' });
+    if (!admin) return res.status(404).json({ msg: "Admin not found!" });
+
+    admin.password = newPassword;
+    await admin.save();
+    await logStatement(superAdminUsername, 'ADMIN PASSWORD RESET', 0, 0, 0, `Reset password for Admin ${adminUsername}`);
+    res.json({ msg: `Password for Admin ${adminUsername} updated successfully!` });
+  } catch (err) { res.status(500).json({ msg: "Server Error" }); }
+});
+
+// SUPER ADMIN: Toggle Admin Lock
+app.post('/api/superadmin/toggle-admin-lock', async (req, res) => {
+  try {
+    const { superAdminUsername, adminUsername } = req.body;
+    const superAdmin = await User.findOne({ username: superAdminUsername });
+    if (!superAdmin || (superAdmin.role !== 'superadmin' && superAdmin.username !== 'Vikram16')) {
+      return res.status(403).json({ msg: "Unauthorized!" });
+    }
+
+    const admin = await User.findOne({ username: adminUsername, role: 'admin' });
+    if (!admin) return res.status(404).json({ msg: "Admin not found!" });
+
+    admin.isLocked = !admin.isLocked;
+    await admin.save();
+    await logStatement(superAdminUsername, admin.isLocked ? 'ADMIN LOCKED' : 'ADMIN UNLOCKED', 0, 0, 0, `${admin.isLocked ? 'Locked' : 'Unlocked'} Admin ${adminUsername}`);
+    res.json({ msg: `Admin ${adminUsername} is now ${admin.isLocked ? 'LOCKED' : 'ACTIVE'}` });
+  } catch (err) { res.status(500).json({ msg: "Server Error" }); }
+});
+
+// NORMAL ADMIN: Create Client
+app.post('/api/admin/create-client', async (req, res) => {
+  try {
+    const { adminUsername, username, password, initialBalance } = req.body;
+    const admin = await User.findOne({ username: adminUsername });
+    if (!admin || (admin.role !== 'admin' && admin.role !== 'superadmin')) {
+      return res.status(403).json({ msg: "Unauthorized!" });
+    }
+
+    const coins = Number(initialBalance) || 0;
+    if (admin.role === 'admin') {
+      if (admin.balance < coins) {
+        return res.status(400).json({ msg: `Insufficient balance! Your Admin balance is ${admin.balance} C.` });
+      }
+      admin.balance -= coins;
+      await admin.save();
+      await logStatement(admin.username, 'CLIENT CREATED', coins, admin.balance + coins, admin.balance, `Created client ${username} with ${coins} coins`);
+    }
+
+    const existing = await User.findOne({ username });
+    if (existing) return res.status(400).json({ msg: "Username already exists!" });
+
+    const newUser = new User({
+      username: username,
+      password: password,
+      role: 'client',
+      createdBy: adminUsername,
+      balance: coins
+    });
     await newUser.save();
-    await logStatement(username, 'ACCOUNT CREATED', coins, 0, coins, `Created with ${coins} coins.`);
+    await logStatement(username, 'ACCOUNT CREATED', coins, 0, coins, `Created by Admin ${adminUsername}`);
     res.json({ msg: `Client ${username} created successfully!` });
   } catch (err) { res.status(500).json({ msg: "Database Error" }); }
 });
 
-app.get('/api/admin/clients', async (req, res) => {
+// NORMAL ADMIN: Get Clients of this Admin
+app.get('/api/admin/clients/:adminUsername', async (req, res) => {
   try {
-    const clients = await User.find({ role: 'client' });
+    const { adminUsername } = req.params;
+    const admin = await User.findOne({ username: adminUsername });
+    if (!admin) return res.status(404).json({ msg: "Admin not found" });
+
+    const query = (admin.role === 'superadmin' || admin.username === 'Vikram16') ? { role: 'client' } : { role: 'client', createdBy: adminUsername };
+    const clients = await User.find(query).sort({ _id: -1 });
     res.json(clients);
   } catch (err) { res.status(500).json({ msg: "Error fetching clients" }); }
 });
 
+// NORMAL ADMIN: Update Client Coins
 app.post('/api/admin/update-coins', async (req, res) => {
   try {
-    const { userId, coins, action } = req.body;
+    const { adminUsername, userId, coins, action } = req.body;
+    const admin = await User.findOne({ username: adminUsername });
+    if (!admin) return res.status(403).json({ msg: "Unauthorized!" });
+
     const user = await User.findOne({ $or: [{ _id: mongoose.Types.ObjectId.isValid(userId) ? userId : null }, { username: userId }] });
     if (!user) return res.status(404).json({ msg: "User not found" });
 
+    if (admin.role !== 'superadmin' && admin.username !== 'Vikram16' && user.createdBy !== adminUsername) {
+      return res.status(403).json({ msg: "Unauthorized! You can only manage your own clients." });
+    }
+
     const amount = Number(coins);
-    const oldBal = user.balance;
+    const oldClientBal = user.balance;
 
     if (action === 'add') {
+      if (admin.role === 'admin') {
+        if (admin.balance < amount) {
+          return res.status(400).json({ msg: `Insufficient Admin balance! Available: ${admin.balance} C.` });
+        }
+        admin.balance -= amount;
+        await admin.save();
+        await logStatement(admin.username, 'DEPOSITED TO CLIENT', amount, admin.balance + amount, admin.balance, `Transferred ${amount} C to ${user.username}`);
+      }
+
       user.balance += amount;
-      await logStatement(user.username, 'BANK DEPOSIT', amount, oldBal, user.balance, `Admin deposited ${amount} coins.`);
+      await logStatement(user.username, 'ADMIN DEPOSIT', amount, oldClientBal, user.balance, `Admin ${adminUsername} deposited ${amount} coins.`);
     } else if (action === 'withdraw') {
+      if (user.balance < amount) return res.status(400).json({ msg: "Client balance is insufficient to withdraw!" });
+
       user.balance -= amount;
-      await logStatement(user.username, 'BANK WITHDRAW', amount, oldBal, user.balance, `Admin withdrew ${amount} coins.`);
+      if (admin.role === 'admin') {
+        admin.balance += amount;
+        await admin.save();
+        await logStatement(admin.username, 'WITHDRAWN FROM CLIENT', amount, admin.balance - amount, admin.balance, `Withdrew ${amount} C from ${user.username}`);
+      }
+
+      await logStatement(user.username, 'ADMIN WITHDRAW', amount, oldClientBal, user.balance, `Admin ${adminUsername} withdrew ${amount} coins.`);
     }
 
     await user.save();
-    res.json({ msg: "Wallet balance updated!" });
+    res.json({ msg: `Transaction successful! Client balance: ${user.balance} C` });
   } catch (err) { res.status(500).json({ msg: "Error updating balance" }); }
 });
 
-app.get('/api/admin/statements', async (req, res) => {
+// NORMAL ADMIN: Change Client Password
+app.post('/api/admin/change-client-password', async (req, res) => {
   try {
-    const logs = await Statement.find().sort({ timestamp: -1 }).limit(100);
+    const { adminUsername, clientUsername, newPassword } = req.body;
+    const admin = await User.findOne({ username: adminUsername });
+    if (!admin) return res.status(403).json({ msg: "Unauthorized!" });
+
+    const client = await User.findOne({ username: clientUsername, role: 'client' });
+    if (!client) return res.status(404).json({ msg: "Client not found!" });
+
+    if (admin.role !== 'superadmin' && admin.username !== 'Vikram16' && client.createdBy !== adminUsername) {
+      return res.status(403).json({ msg: "Unauthorized! You can only manage your own clients." });
+    }
+
+    client.password = newPassword;
+    await client.save();
+    await logStatement(adminUsername, 'CLIENT PASSWORD RESET', 0, 0, 0, `Reset password for client ${clientUsername}`);
+    res.json({ msg: `Password for ${clientUsername} updated successfully!` });
+  } catch (err) { res.status(500).json({ msg: "Server Error" }); }
+});
+
+// NORMAL ADMIN: Toggle Client Lock
+app.post('/api/admin/toggle-client-lock', async (req, res) => {
+  try {
+    const { adminUsername, clientUsername } = req.body;
+    const admin = await User.findOne({ username: adminUsername });
+    if (!admin) return res.status(403).json({ msg: "Unauthorized!" });
+
+    const client = await User.findOne({ username: clientUsername, role: 'client' });
+    if (!client) return res.status(404).json({ msg: "Client not found!" });
+
+    if (admin.role !== 'superadmin' && admin.username !== 'Vikram16' && client.createdBy !== adminUsername) {
+      return res.status(403).json({ msg: "Unauthorized! You can only manage your own clients." });
+    }
+
+    client.isLocked = !client.isLocked;
+    await client.save();
+    await logStatement(adminUsername, client.isLocked ? 'CLIENT LOCKED' : 'CLIENT UNLOCKED', 0, 0, 0, `${client.isLocked ? 'Locked' : 'Unlocked'} client ${clientUsername}`);
+    res.json({ msg: `Client ${clientUsername} is now ${client.isLocked ? 'LOCKED' : 'ACTIVE'}` });
+  } catch (err) { res.status(500).json({ msg: "Server Error" }); }
+});
+
+// MARKET ANALYSIS API (SUPER ADMIN = ALL SUB-ADMIN BETS TOTAL, ADMIN = OWN CLIENTS BETS)
+app.get('/api/admin/market-analysis/:adminUsername', async (req, res) => {
+  try {
+    const { adminUsername } = req.params;
+    const admin = await User.findOne({ username: adminUsername });
+    if (!admin) return res.status(404).json({ msg: "Admin not found" });
+
+    let betQuery = { status: 'PENDING' };
+    if (admin.role !== 'superadmin' && admin.username !== 'Vikram16') {
+      const myClients = await User.find({ createdBy: adminUsername }).select('username');
+      const clientUsernames = myClients.map(c => c.username);
+      betQuery.username = { $in: clientUsernames };
+    }
+
+    const pendingBets = await Bet.find(betQuery);
+
+    const analysis = {};
+    MARKET_SCHEDULE.forEach(m => {
+      analysis[m.name] = { totalBets: 0, totalCoins: 0, andarCoins: 0, baharCoins: 0, doubleCoins: 0 };
+    });
+
+    pendingBets.forEach(b => {
+      if (!analysis[b.market]) {
+        analysis[b.market] = { totalBets: 0, totalCoins: 0, andarCoins: 0, baharCoins: 0, doubleCoins: 0 };
+      }
+      analysis[b.market].totalBets += 1;
+      analysis[b.market].totalCoins += b.coins;
+      if (b.type === 'single_a') analysis[b.market].andarCoins += b.coins;
+      if (b.type === 'single_b') analysis[b.market].baharCoins += b.coins;
+      if (b.type === 'double') analysis[b.market].doubleCoins += b.coins;
+    });
+
+    res.json(analysis);
+  } catch (err) { res.status(500).json({ msg: "Error fetching market analysis" }); }
+});
+
+// STATEMENTS (SUPER ADMIN = SUPER ADMIN LOGS, ADMIN = OWN & CLIENT LOGS)
+app.get('/api/admin/statements/:adminUsername', async (req, res) => {
+  try {
+    const { adminUsername } = req.params;
+    const admin = await User.findOne({ username: adminUsername });
+    if (!admin) return res.status(404).json({ msg: "Admin not found" });
+
+    if (admin.role === 'superadmin' || admin.username === 'Vikram16') {
+      const logs = await Statement.find({ username: adminUsername }).sort({ timestamp: -1 }).limit(100);
+      return res.json(logs);
+    }
+
+    const myUsers = await User.find({ createdBy: adminUsername }).select('username');
+    const myUsernames = myUsers.map(u => u.username);
+    myUsernames.push(adminUsername);
+
+    const logs = await Statement.find({ username: { $in: myUsernames } }).sort({ timestamp: -1 }).limit(100);
     res.json(logs);
   } catch (err) { res.status(500).json({ msg: "Error fetching statements" }); }
 });
