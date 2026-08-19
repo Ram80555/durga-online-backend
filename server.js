@@ -11,8 +11,9 @@ const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://ramdulare2411_db_user:
 
 mongoose.connect(MONGO_URI)
   .then(() => {
-    console.log("MongoDB Connected");
-    MARKET_SCHEDULE.forEach(m => processMarketSettlement(m));
+    console.log("MongoDB Database Connected Successfully");
+    // Only refresh display prices on start, NEVER settle bets on start!
+    MARKET_SCHEDULE.forEach(m => refreshDisplayPrice(m));
   })
   .catch(err => console.log("Mongo Error: ", err));
 
@@ -101,7 +102,27 @@ function fetchQuotePrice(symbol) {
   });
 }
 
-// AUTO SETTLE PROCESS WITH SINGLE A, SINGLE B, DOUBLE
+// ONLY REFRESH DISPLAY VALUES (NO SETTLEMENT)
+async function refreshDisplayPrice(m) {
+  try {
+    const closePrice = await fetchQuotePrice(m.symbol);
+    if (!closePrice) return;
+
+    const priceStr = Number(closePrice).toFixed(2);
+    const parts = priceStr.split('.');
+    const doubleDigit = parts.length > 1 ? parts[1].padEnd(2, '0').slice(0, 2) : priceStr.slice(-2);
+    const singleDigitA = doubleDigit.slice(0, 1);
+    const singleDigitB = doubleDigit.slice(1, 2);
+
+    await MarketResult.findOneAndUpdate(
+      { market: m.name },
+      { closingValue: priceStr, singleDigitA, singleDigitB, doubleDigit, lastUpdated: new Date() },
+      { upsert: true, new: true }
+    );
+  } catch (err) {}
+}
+
+// STRICT TIME-BASED AUTO SETTLE (ONLY RUNS AT SCHEDULED SETTLE TIME)
 async function processMarketSettlement(m) {
   try {
     const now = new Date();
@@ -110,19 +131,18 @@ async function processMarketSettlement(m) {
     const dayOfWeek = istTime.getDay();
 
     if (dayOfWeek === 0 || dayOfWeek === 6) {
-      console.log(`[WEEKEND] Market settlement paused on Weekend for ${m.name}. All bets stay pending for Monday.`);
+      console.log(`[WEEKEND] Settlement paused for ${m.name}`);
       return;
     }
 
     const closePrice = await fetchQuotePrice(m.symbol);
     if (!closePrice) return;
 
-    const priceStr = Number(closePrice).toFixed(2); // e.g., "6258.58"
+    const priceStr = Number(closePrice).toFixed(2);
     const parts = priceStr.split('.');
-    const doubleDigit = parts.length > 1 ? parts[1].padEnd(2, '0').slice(0, 2) : priceStr.slice(-2); // "58"
-    
-    const singleDigitA = doubleDigit.slice(0, 1); // "5" (Second last digit)
-    const singleDigitB = doubleDigit.slice(1, 2); // "8" (Last digit)
+    const doubleDigit = parts.length > 1 ? parts[1].padEnd(2, '0').slice(0, 2) : priceStr.slice(-2);
+    const singleDigitA = doubleDigit.slice(0, 1);
+    const singleDigitB = doubleDigit.slice(1, 2);
 
     await MarketResult.findOneAndUpdate(
       { market: m.name },
@@ -131,6 +151,7 @@ async function processMarketSettlement(m) {
     );
 
     const pendingBets = await Bet.find({ market: m.name, status: 'PENDING' });
+    console.log(`[SETTLE TIME REACHED] Settling ${pendingBets.length} bets for ${m.name} with result ${doubleDigit}`);
 
     for (let b of pendingBets) {
       let isWin = false;
@@ -168,9 +189,13 @@ async function processMarketSettlement(m) {
       }
       await b.save();
     }
-  } catch (err) {}
+  } catch (err) {
+    console.log(`[SETTLE ERROR] ${m.name}:`, err.message);
+  }
 }
 
+// CRON: RUNS EVERY 30 SECONDS & EXECUTES ONLY WHEN EXACT SETTLE TIME ARRIVES
+let lastSettledMinute = '';
 setInterval(() => {
   const now = new Date();
   const istOffset = 5.5 * 60 * 60 * 1000;
@@ -179,11 +204,14 @@ setInterval(() => {
   const curM = istTime.getMinutes().toString().padStart(2, '0');
   const currentTimeStr = `${curH}:${curM}`;
 
-  MARKET_SCHEDULE.forEach(m => {
-    if (m.settleTime === currentTimeStr) {
-      processMarketSettlement(m);
-    }
-  });
+  if (lastSettledMinute !== currentTimeStr) {
+    MARKET_SCHEDULE.forEach(m => {
+      if (m.settleTime === currentTimeStr) {
+        lastSettledMinute = currentTimeStr;
+        processMarketSettlement(m);
+      }
+    });
+  }
 }, 30000);
 
 // AUTH ENDPOINTS
@@ -276,7 +304,9 @@ app.post('/api/client/place-bet', async (req, res) => {
 
     await logStatement(user.username, 'BET PLACED', betCoins, oldBal, user.balance, `Prediction placed on ${market} (${type.toUpperCase()}: ${selectedDigit})`);
     res.json({ msg: "Prediction placed successfully!" });
-  } catch (err) { res.status(500).json({ msg: "Server error processing prediction" }); }
+  } catch (err) {
+    res.status(500).json({ msg: "Server error processing prediction" });
+  }
 });
 
 app.get('/api/client/pending-bets/:username', async (req, res) => {
