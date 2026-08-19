@@ -11,8 +11,7 @@ const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://ramdulare2411_db_user:
 
 mongoose.connect(MONGO_URI)
   .then(() => {
-    console.log("MongoDB Database Connected Successfully");
-    // Only refresh display prices on start, NEVER settle bets on start!
+    console.log("MongoDB Connected");
     MARKET_SCHEDULE.forEach(m => refreshDisplayPrice(m));
   })
   .catch(err => console.log("Mongo Error: ", err));
@@ -54,6 +53,10 @@ const Statement = mongoose.model('Statement', statementSchema);
 const resultSchema = new mongoose.Schema({
   market: { type: String, required: true, unique: true },
   closingValue: { type: String, default: '0.00' },
+  change: { type: String, default: '+0.00' },
+  percentChange: { type: String, default: '0.00%' },
+  isPositive: { type: Boolean, default: true },
+  sparkline: { type: [Number], default: [] },
   singleDigitA: { type: String, default: '-' },
   singleDigitB: { type: String, default: '-' },
   doubleDigit: { type: String, default: '--' },
@@ -76,9 +79,10 @@ const MARKET_SCHEDULE = [
   { name: 'DOW JONES', symbol: '^DJI', settleTime: '01:32' }
 ];
 
+// FETCH REAL-TIME INTRADAY DATA WITH SPARKLINE SERIES
 function fetchQuotePrice(symbol) {
   return new Promise((resolve, reject) => {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`;
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=1d&interval=5m`;
     const options = {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -92,9 +96,28 @@ function fetchQuotePrice(symbol) {
         try {
           const json = JSON.parse(body);
           if (json.chart && json.chart.result && json.chart.result[0]) {
-            const meta = json.chart.result[0].meta;
+            const resObj = json.chart.result[0];
+            const meta = resObj.meta;
             const price = meta.regularMarketPrice || meta.chartPreviousClose || meta.previousClose;
-            resolve(price);
+            const prevClose = meta.chartPreviousClose || meta.previousClose || price;
+            const diff = price - prevClose;
+            const pct = prevClose ? ((diff / prevClose) * 100).toFixed(2) : '0.00';
+            
+            // Extract raw intraday close prices for real wave graph
+            let rawQuotes = [];
+            if (resObj.indicators && resObj.indicators.quote && resObj.indicators.quote[0] && resObj.indicators.quote[0].close) {
+              rawQuotes = resObj.indicators.quote[0].close.filter(p => p !== null && !isNaN(p));
+            }
+            // Sample down to 20-30 data points for responsive chart
+            const sparkline = rawQuotes.length > 0 ? rawQuotes.filter((_, idx) => idx % Math.max(1, Math.floor(rawQuotes.length / 25)) === 0) : [];
+
+            resolve({
+              price: price,
+              change: (diff >= 0 ? `+${diff.toFixed(2)}` : `${diff.toFixed(2)}`),
+              percentChange: `${pct}%`,
+              isPositive: diff >= 0,
+              sparkline: sparkline
+            });
           } else { reject('No price meta'); }
         } catch(e) { reject(e); }
       });
@@ -102,13 +125,14 @@ function fetchQuotePrice(symbol) {
   });
 }
 
-// ONLY REFRESH DISPLAY VALUES (NO SETTLEMENT)
+// REFRESH REAL LIVE RATES & STATS
 async function refreshDisplayPrice(m) {
   try {
-    const closePrice = await fetchQuotePrice(m.symbol);
-    if (!closePrice) return;
+    const data = await fetchQuotePrice(m.symbol);
+    if (!data || !data.price) return;
 
-    const priceStr = Number(closePrice).toFixed(2);
+    const priceFormatted = Number(data.price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const priceStr = Number(data.price).toFixed(2);
     const parts = priceStr.split('.');
     const doubleDigit = parts.length > 1 ? parts[1].padEnd(2, '0').slice(0, 2) : priceStr.slice(-2);
     const singleDigitA = doubleDigit.slice(0, 1);
@@ -116,13 +140,27 @@ async function refreshDisplayPrice(m) {
 
     await MarketResult.findOneAndUpdate(
       { market: m.name },
-      { closingValue: priceStr, singleDigitA, singleDigitB, doubleDigit, lastUpdated: new Date() },
+      { 
+        closingValue: priceFormatted, 
+        change: data.change,
+        percentChange: data.percentChange,
+        isPositive: data.isPositive,
+        sparkline: data.sparkline,
+        singleDigitA, 
+        singleDigitB, 
+        doubleDigit, 
+        lastUpdated: new Date() 
+      },
       { upsert: true, new: true }
     );
   } catch (err) {}
 }
 
-// STRICT TIME-BASED AUTO SETTLE (ONLY RUNS AT SCHEDULED SETTLE TIME)
+setInterval(() => {
+  MARKET_SCHEDULE.forEach(m => refreshDisplayPrice(m));
+}, 30000);
+
+// AUTO SETTLE PROCESS
 async function processMarketSettlement(m) {
   try {
     const now = new Date();
@@ -130,15 +168,13 @@ async function processMarketSettlement(m) {
     const istTime = new Date(now.getTime() + (now.getTimezoneOffset() * 60000) + istOffset);
     const dayOfWeek = istTime.getDay();
 
-    if (dayOfWeek === 0 || dayOfWeek === 6) {
-      console.log(`[WEEKEND] Settlement paused for ${m.name}`);
-      return;
-    }
+    if (dayOfWeek === 0 || dayOfWeek === 6) return;
 
-    const closePrice = await fetchQuotePrice(m.symbol);
-    if (!closePrice) return;
+    const data = await fetchQuotePrice(m.symbol);
+    if (!data || !data.price) return;
 
-    const priceStr = Number(closePrice).toFixed(2);
+    const priceStr = Number(data.price).toFixed(2);
+    const priceFormatted = Number(data.price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     const parts = priceStr.split('.');
     const doubleDigit = parts.length > 1 ? parts[1].padEnd(2, '0').slice(0, 2) : priceStr.slice(-2);
     const singleDigitA = doubleDigit.slice(0, 1);
@@ -146,12 +182,21 @@ async function processMarketSettlement(m) {
 
     await MarketResult.findOneAndUpdate(
       { market: m.name },
-      { closingValue: priceStr, singleDigitA, singleDigitB, doubleDigit, lastUpdated: new Date() },
+      { 
+        closingValue: priceFormatted, 
+        change: data.change,
+        percentChange: data.percentChange,
+        isPositive: data.isPositive,
+        sparkline: data.sparkline,
+        singleDigitA, 
+        singleDigitB, 
+        doubleDigit, 
+        lastUpdated: new Date() 
+      },
       { upsert: true, new: true }
     );
 
     const pendingBets = await Bet.find({ market: m.name, status: 'PENDING' });
-    console.log(`[SETTLE TIME REACHED] Settling ${pendingBets.length} bets for ${m.name} with result ${doubleDigit}`);
 
     for (let b of pendingBets) {
       let isWin = false;
@@ -189,12 +234,9 @@ async function processMarketSettlement(m) {
       }
       await b.save();
     }
-  } catch (err) {
-    console.log(`[SETTLE ERROR] ${m.name}:`, err.message);
-  }
+  } catch (err) {}
 }
 
-// CRON: RUNS EVERY 30 SECONDS & EXECUTES ONLY WHEN EXACT SETTLE TIME ARRIVES
 let lastSettledMinute = '';
 setInterval(() => {
   const now = new Date();
@@ -254,9 +296,7 @@ app.post('/api/client/change-password', async (req, res) => {
   try {
     const { username, oldPassword, newPassword } = req.body;
     const user = await User.findOne({ username, password: oldPassword });
-    if (!user) {
-      return res.status(400).json({ msg: "Old password does not match!" });
-    }
+    if (!user) return res.status(400).json({ msg: "Old password does not match!" });
     user.password = newPassword;
     await user.save();
     await logStatement(username, 'PASSWORD CHANGED', 0, user.balance, user.balance, 'User updated account password.');
