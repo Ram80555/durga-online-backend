@@ -12,8 +12,6 @@ const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://ramdulare2411_db_user:
 mongoose.connect(MONGO_URI)
   .then(async () => {
     console.log("MongoDB Database Connected Successfully");
-    
-    // AUTO-SEED / SYNC SUPER ADMIN CREDENTIALS (SECURE SERVER-SIDE)
     try {
       const superAdmin = await User.findOne({ username: 'Vikram16' });
       if (!superAdmin) {
@@ -22,20 +20,16 @@ mongoose.connect(MONGO_URI)
           password: 'Rajput8932@',
           role: 'superadmin',
           balance: 0,
+          upline: 0,
           createdBy: 'system'
         });
         await newSuper.save();
-        console.log("[SECURITY] Super Admin Vikram16 created with permanent default password.");
       } else {
         superAdmin.password = 'Rajput8932@';
         superAdmin.role = 'superadmin';
         await superAdmin.save();
-        console.log("[SECURITY] Super Admin Vikram16 credentials synced successfully.");
       }
-    } catch(e) {
-      console.log("[SECURITY ERROR]", e.message);
-    }
-
+    } catch(e) {}
     MARKET_SCHEDULE.forEach(m => refreshDisplayPrice(m));
   })
   .catch(err => console.log("Mongo Error: ", err));
@@ -44,9 +38,10 @@ mongoose.connect(MONGO_URI)
 const userSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
   password: { type: String, required: true },
-  role: { type: String, default: 'client' }, // 'superadmin', 'admin', 'client'
+  role: { type: String, default: 'client' },
   createdBy: { type: String, default: 'system' },
   balance: { type: Number, default: 0 },
+  upline: { type: Number, default: 0 },
   exposure: { type: Number, default: 0 },
   isLocked: { type: Boolean, default: false },
   sessionToken: { type: String, default: '' }
@@ -233,23 +228,33 @@ async function processMarketSettlement(m) {
         winMultiplier = 80;
       }
 
-      if (isWin) {
-        b.status = 'WIN';
-        const winAmount = b.coins * winMultiplier;
-        const user = await User.findOne({ username: b.username });
-        if (user) {
+      const user = await User.findOne({ username: b.username });
+      if (user) {
+        const parentAdmin = await User.findOne({ username: user.createdBy });
+
+        if (isWin) {
+          b.status = 'WIN';
+          const winAmount = b.coins * winMultiplier;
           const oldBal = user.balance;
           user.balance += winAmount;
           user.exposure = Math.max(0, user.exposure - b.coins);
           await user.save();
           await logStatement(user.username, 'BET WIN', winAmount, oldBal, user.balance, `Won ${b.market} ${b.type.toUpperCase()} (${b.digit}). Payout ${winMultiplier}x.`);
-        }
-      } else {
-        b.status = 'LOSS';
-        const user = await User.findOne({ username: b.username });
-        if (user) {
+
+          const netWinCoins = winAmount - b.coins;
+          if (parentAdmin) {
+            parentAdmin.upline = (parentAdmin.upline || 0) - netWinCoins;
+            await parentAdmin.save();
+          }
+        } else {
+          b.status = 'LOSS';
           user.exposure = Math.max(0, user.exposure - b.coins);
           await user.save();
+
+          if (parentAdmin) {
+            parentAdmin.upline = (parentAdmin.upline || 0) + b.coins;
+            await parentAdmin.save();
+          }
         }
       }
       await b.save();
@@ -280,11 +285,11 @@ setInterval(() => {
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body;
-    const user = await User.findOne({ username, password });
+    const user = await User.findOne({ username: { $regex: new RegExp(`^${username.trim()}$`, 'i') }, password });
     if (!user) return res.status(400).json({ msg: "Invalid Username or Password!" });
     if (user.isLocked) return res.status(403).json({ msg: "Account is LOCKED by Admin!" });
 
-    if (user.username === 'Vikram16' && user.role !== 'superadmin') {
+    if (user.username.toLowerCase() === 'vikram16' && user.role !== 'superadmin') {
       user.role = 'superadmin';
     }
 
@@ -298,6 +303,7 @@ app.post('/api/auth/login', async (req, res) => {
         username: user.username,
         role: user.role,
         balance: user.balance,
+        upline: user.upline || 0,
         exposure: user.exposure,
         sessionToken: newToken
       }
@@ -312,7 +318,24 @@ app.post('/api/auth/verify-session', async (req, res) => {
     if (!user || user.sessionToken !== sessionToken) {
       return res.status(401).json({ valid: false, msg: "Logged in from another device!" });
     }
-    res.json({ valid: true, balance: user.balance, exposure: user.exposure, role: user.role });
+
+    let calculatedUpline = user.upline || 0;
+    let totalCirculatingBal = user.balance || 0;
+
+    if (user.role === 'superadmin' || user.username.toLowerCase() === 'vikram16') {
+      const allAdmins = await User.find({ role: 'admin' });
+      totalCirculatingBal = allAdmins.reduce((sum, a) => sum + (a.balance || 0), 0);
+      calculatedUpline = allAdmins.reduce((sum, a) => sum + (a.upline || 0), 0);
+    }
+
+    res.json({ 
+      valid: true, 
+      balance: user.balance, 
+      totalBal: totalCirculatingBal,
+      upline: calculatedUpline, 
+      exposure: user.exposure, 
+      role: user.role 
+    });
   } catch (err) { res.status(500).json({ valid: false }); }
 });
 
@@ -393,23 +416,30 @@ app.post('/api/superadmin/create-admin', async (req, res) => {
     const { superAdminUsername, newAdminUsername, password, initialBalance } = req.body;
     const superAdmin = await User.findOne({ username: superAdminUsername });
     if (!superAdmin || (superAdmin.role !== 'superadmin' && superAdmin.username !== 'Vikram16')) {
-      return res.status(403).json({ msg: "Unauthorized! Only Super Admin can create admins." });
+      return res.status(403).json({ msg: "Unauthorized!" });
     }
 
-    const existing = await User.findOne({ username: newAdminUsername });
+    const cleanUsername = newAdminUsername.trim();
+    const reservedNames = ['vikram16', 'admin', 'superadmin', 'root', 'master'];
+    if (reservedNames.includes(cleanUsername.toLowerCase())) {
+      return res.status(400).json({ msg: "This admin username is reserved!" });
+    }
+
+    const existing = await User.findOne({ username: { $regex: new RegExp(`^${cleanUsername}$`, 'i') } });
     if (existing) return res.status(400).json({ msg: "Admin username already exists!" });
 
     const coins = Number(initialBalance) || 0;
     const newAdmin = new User({
-      username: newAdminUsername,
-      password: password,
+      username: cleanUsername,
+      password: password.trim(),
       role: 'admin',
       createdBy: superAdminUsername,
-      balance: coins
+      balance: coins,
+      upline: 0
     });
     await newAdmin.save();
-    await logStatement(superAdminUsername, 'ADMIN CREATED', coins, 0, 0, `Created Admin ${newAdminUsername} with ${coins} coins.`);
-    res.json({ msg: `Admin ${newAdminUsername} created successfully!` });
+    await logStatement(superAdminUsername, 'ADMIN CREATED', coins, 0, 0, `Created Admin ${cleanUsername} with ${coins} coins.`);
+    res.json({ msg: `Admin ${cleanUsername} created successfully!` });
   } catch (err) { res.status(500).json({ msg: "Database Error" }); }
 });
 
@@ -457,7 +487,7 @@ app.post('/api/superadmin/change-admin-password', async (req, res) => {
     const admin = await User.findOne({ username: adminUsername, role: 'admin' });
     if (!admin) return res.status(404).json({ msg: "Admin not found!" });
 
-    admin.password = newPassword;
+    admin.password = newPassword.trim();
     await admin.save();
     await logStatement(superAdminUsername, 'ADMIN PASSWORD RESET', 0, 0, 0, `Reset password for Admin ${adminUsername}`);
     res.json({ msg: `Password for Admin ${adminUsername} updated successfully!` });
@@ -486,10 +516,20 @@ app.post('/api/superadmin/toggle-admin-lock', async (req, res) => {
 app.post('/api/admin/create-client', async (req, res) => {
   try {
     const { adminUsername, username, password, initialBalance } = req.body;
+    const cleanUsername = (username || '').trim();
+
+    const reservedNames = ['vikram16', 'admin', 'superadmin', 'root', 'master'];
+    if (reservedNames.includes(cleanUsername.toLowerCase())) {
+      return res.status(400).json({ msg: "This username is reserved!" });
+    }
+
     const admin = await User.findOne({ username: adminUsername });
     if (!admin || (admin.role !== 'admin' && admin.role !== 'superadmin')) {
       return res.status(403).json({ msg: "Unauthorized!" });
     }
+
+    const existing = await User.findOne({ username: { $regex: new RegExp(`^${cleanUsername}$`, 'i') } });
+    if (existing) return res.status(400).json({ msg: "Username already exists in database!" });
 
     const coins = Number(initialBalance) || 0;
     if (admin.role === 'admin') {
@@ -498,22 +538,19 @@ app.post('/api/admin/create-client', async (req, res) => {
       }
       admin.balance -= coins;
       await admin.save();
-      await logStatement(admin.username, 'CLIENT CREATED', coins, admin.balance + coins, admin.balance, `Created client ${username} with ${coins} coins`);
+      await logStatement(admin.username, 'CLIENT CREATED', coins, admin.balance + coins, admin.balance, `Created client ${cleanUsername} with ${coins} coins`);
     }
 
-    const existing = await User.findOne({ username });
-    if (existing) return res.status(400).json({ msg: "Username already exists!" });
-
     const newUser = new User({
-      username: username,
-      password: password,
+      username: cleanUsername,
+      password: password.trim(),
       role: 'client',
       createdBy: adminUsername,
       balance: coins
     });
     await newUser.save();
-    await logStatement(username, 'ACCOUNT CREATED', coins, 0, coins, `Created by Admin ${adminUsername}`);
-    res.json({ msg: `Client ${username} created successfully!` });
+    await logStatement(cleanUsername, 'ACCOUNT CREATED', coins, 0, coins, `Created by Admin ${adminUsername}`);
+    res.json({ msg: `Client ${cleanUsername} created successfully!` });
   } catch (err) { res.status(500).json({ msg: "Database Error" }); }
 });
 
@@ -523,7 +560,7 @@ app.get('/api/admin/clients/:adminUsername', async (req, res) => {
     const admin = await User.findOne({ username: adminUsername });
     if (!admin) return res.status(404).json({ msg: "Admin not found" });
 
-    const query = (admin.role === 'superadmin' || admin.username === 'Vikram16') ? { role: 'client' } : { role: 'client', createdBy: adminUsername };
+    const query = (admin.role === 'superadmin' || admin.username.toLowerCase() === 'vikram16') ? { role: 'client' } : { role: 'client', createdBy: adminUsername };
     const clients = await User.find(query).sort({ _id: -1 });
     res.json(clients);
   } catch (err) { res.status(500).json({ msg: "Error fetching clients" }); }
@@ -538,7 +575,7 @@ app.post('/api/admin/update-coins', async (req, res) => {
     const user = await User.findOne({ $or: [{ _id: mongoose.Types.ObjectId.isValid(userId) ? userId : null }, { username: userId }] });
     if (!user) return res.status(404).json({ msg: "User not found" });
 
-    if (admin.role !== 'superadmin' && admin.username !== 'Vikram16' && user.createdBy !== adminUsername) {
+    if (admin.role !== 'superadmin' && admin.username.toLowerCase() !== 'vikram16' && user.createdBy !== adminUsername) {
       return res.status(403).json({ msg: "Unauthorized! You can only manage your own clients." });
     }
 
@@ -584,11 +621,11 @@ app.post('/api/admin/change-client-password', async (req, res) => {
     const client = await User.findOne({ username: clientUsername, role: 'client' });
     if (!client) return res.status(404).json({ msg: "Client not found!" });
 
-    if (admin.role !== 'superadmin' && admin.username !== 'Vikram16' && client.createdBy !== adminUsername) {
+    if (admin.role !== 'superadmin' && admin.username.toLowerCase() !== 'vikram16' && client.createdBy !== adminUsername) {
       return res.status(403).json({ msg: "Unauthorized! You can only manage your own clients." });
     }
 
-    client.password = newPassword;
+    client.password = newPassword.trim();
     await client.save();
     await logStatement(adminUsername, 'CLIENT PASSWORD RESET', 0, 0, 0, `Reset password for client ${clientUsername}`);
     res.json({ msg: `Password for ${clientUsername} updated successfully!` });
@@ -604,7 +641,7 @@ app.post('/api/admin/toggle-client-lock', async (req, res) => {
     const client = await User.findOne({ username: clientUsername, role: 'client' });
     if (!client) return res.status(404).json({ msg: "Client not found!" });
 
-    if (admin.role !== 'superadmin' && admin.username !== 'Vikram16' && client.createdBy !== adminUsername) {
+    if (admin.role !== 'superadmin' && admin.username.toLowerCase() !== 'vikram16' && client.createdBy !== adminUsername) {
       return res.status(403).json({ msg: "Unauthorized! You can only manage your own clients." });
     }
 
@@ -615,6 +652,57 @@ app.post('/api/admin/toggle-client-lock', async (req, res) => {
   } catch (err) { res.status(500).json({ msg: "Server Error" }); }
 });
 
+// TOP PERFORMERS API (TOP ADMINS FOR SUPERADMIN, TOP CLIENTS FOR ADMIN)
+app.get('/api/admin/top-performers/:adminUsername', async (req, res) => {
+  try {
+    const { adminUsername } = req.params;
+    const admin = await User.findOne({ username: adminUsername });
+    if (!admin) return res.status(404).json({ msg: "Admin not found" });
+
+    if (admin.role === 'superadmin' || admin.username.toLowerCase() === 'vikram16') {
+      const topAdmins = await User.find({ role: 'admin' }).sort({ upline: -1 }).limit(10);
+      return res.json({ type: 'admins', data: topAdmins });
+    }
+
+    const myClients = await User.find({ role: 'client', createdBy: adminUsername }).sort({ balance: -1 }).limit(10);
+    res.json({ type: 'clients', data: myClients });
+  } catch (err) { res.status(500).json({ msg: "Error fetching top performers" }); }
+});
+
+// WEEKLY REPORT API (LAST 7 DAYS ACTIVITY)
+app.get('/api/admin/weekly-report/:adminUsername', async (req, res) => {
+  try {
+    const { adminUsername } = req.params;
+    const admin = await User.findOne({ username: adminUsername });
+    if (!admin) return res.status(404).json({ msg: "Admin not found" });
+
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+    let betQuery = { createdAt: { $gte: sevenDaysAgo } };
+    if (admin.role !== 'superadmin' && admin.username.toLowerCase() !== 'vikram16') {
+      const myClients = await User.find({ createdBy: adminUsername }).select('username');
+      const clientUsernames = myClients.map(c => c.username);
+      betQuery.username = { $in: clientUsernames };
+    }
+
+    const weeklyBets = await Bet.find(betQuery);
+    const totalVolume = weeklyBets.reduce((sum, b) => sum + b.coins, 0);
+    const winningBets = weeklyBets.filter(b => b.status === 'WIN');
+    const losingBets = weeklyBets.filter(b => b.status === 'LOSS');
+    const pendingBets = weeklyBets.filter(b => b.status === 'PENDING');
+
+    res.json({
+      totalBets: weeklyBets.length,
+      totalVolume,
+      winCount: winningBets.length,
+      lossCount: losingBets.length,
+      pendingCount: pendingBets.length,
+      netUplinePnl: admin.upline || 0
+    });
+  } catch (err) { res.status(500).json({ msg: "Error fetching weekly report" }); }
+});
+
 // ANALYSIS & STATEMENTS
 app.get('/api/admin/market-analysis/:adminUsername', async (req, res) => {
   try {
@@ -623,7 +711,7 @@ app.get('/api/admin/market-analysis/:adminUsername', async (req, res) => {
     if (!admin) return res.status(404).json({ msg: "Admin not found" });
 
     let betQuery = { status: 'PENDING' };
-    if (admin.role !== 'superadmin' && admin.username !== 'Vikram16') {
+    if (admin.role !== 'superadmin' && admin.username.toLowerCase() !== 'vikram16') {
       const myClients = await User.find({ createdBy: adminUsername }).select('username');
       const clientUsernames = myClients.map(c => c.username);
       betQuery.username = { $in: clientUsernames };
@@ -657,7 +745,7 @@ app.get('/api/admin/statements/:adminUsername', async (req, res) => {
     const admin = await User.findOne({ username: adminUsername });
     if (!admin) return res.status(404).json({ msg: "Admin not found" });
 
-    if (admin.role === 'superadmin' || admin.username === 'Vikram16') {
+    if (admin.role === 'superadmin' || admin.username.toLowerCase() === 'vikram16') {
       const logs = await Statement.find({ username: adminUsername }).sort({ timestamp: -1 }).limit(100);
       return res.json(logs);
     }
